@@ -1,6 +1,6 @@
 ---
 id: intro
-title: Introduction
+title: Angle Introduction
 sidebar_label: Introduction
 ---
 
@@ -12,7 +12,7 @@ particularly suited for finding and extracting data from Glean.
 
 To give you a flavour of the query language, here is how we could
 return the names of all the member declarations defined in a
-Javascript file `project/myfile.js`:
+JavaScript file `project/myfile.js`:
 
 ```
 N where

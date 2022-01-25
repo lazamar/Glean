@@ -51,7 +51,7 @@ See [shell options](#shell-options) for more command-line options.
 
 ## Shell options
 
-The shell accepts all the [common options](running#common-options). Additionally:
+The shell accepts all the [common options](./running.md#common-options). Additionally:
 
 * `QUERY` or `:COMMAND`<br />
 Perform the given `QUERY` or `:COMMAND` and then exit. If multiple
@@ -75,9 +75,9 @@ unique. For example, `:edit` can be abbreviated as `:e`.
 
 * `:database NAME` or `:database NAME/HASH`<br/>
 Use database `NAME` or `NAME/HASH`.
-* `list NAME`<br />
+* `:list NAME`<br />
 List available databases which match `NAME`.
-* `list-all NAME`<br />
+* `:list-all NAME`<br />
 List available databases, and restorable backups, which match `NAME`.
 * `:index LANGUAGE DIR`<br/>
 Index some source code for `LANGUAGE` in directory `DIR`, creating a
@@ -104,6 +104,10 @@ results.
 * `:timeout off|MILLISECONDS`<br />
 Set the query time budget. If the time limit expires, the results so
 far are returned, and you can type `:more` to see more results.
+* `:expand off|on`<br />
+Recursively expand nested facts in the response. `on` by default.
+* `:pager off|on`<br />
+Enable/disable result paging.
 * `:count QUERY`<br />
 Show only a count of query results, not the results themselves
 * `:more`<br />
@@ -113,7 +117,7 @@ Show query profiling information; see [Query Debugging](angle/debugging.md).
 * `:reload`<br />
 Reload the schema (when using `--schema`). This command is useful when
 making changes to the schema, including [derived
-predicates](derived). Edit the schema source files, `:reload` and then
+predicates](./derived.md). Edit the schema source files, `:reload` and then
 test your changes.
 * `:statistics [PREDICATE]`<br />
 Show statistics for the current database.

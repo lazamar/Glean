@@ -21,7 +21,7 @@ that are needed for building Glean.
 
 * [GHC](https://www.haskell.org/ghc/). To see which versions Glean is tested with, check the current [ci.yml](https://github.com/facebookincubator/Glean/blob/master/.github/workflows/ci.yml) script.
 
-* Cabal/cabal-install. Unfortunately because hsthrift currently depends on features that are not in a released version of Cabal (3.6+), you have to build it from source, see https://github.com/facebookincubator/hsthrift#building-and-testing
+* Cabal/cabal-install version 3.6 or later (older versions won't work).
 
 Additional per-distribution setup follows.
 
@@ -63,6 +63,22 @@ sudo apt-get install \
     librocksdb-dev \
     libxxhash-dev
 ```
+
+### Debian
+
+The package dependencies for Debian current are the same as above for Ubuntu, except you may see:
+```
+ Package 'libmysqlclient-dev' has no installation candidate
+```
+Use
+```
+        default-libmysqlclient-dev
+```
+instead. You also need to install:
+```
+        libfmt-dev
+```
+instead.
 
 ### Fedora
 
@@ -107,7 +123,7 @@ Clone the repository:
 
 ```
 git clone https://github.com/facebookincubator/Glean.git
-cd glean
+cd Glean
 ```
 
 These are necessary so that the Glean build can find the dependencies

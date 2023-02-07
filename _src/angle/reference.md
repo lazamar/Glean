@@ -63,11 +63,15 @@ Terms have the following forms:
 *term* ::=<br />
 &nbsp;&nbsp;    *variable* <br />
 
-> A **variable** names the terms that match at this position in the query. The variable can be menioned elsewhere in the query; it doesn't usually make sense for a variable to be mentioned only once, since then you might as well just use a wildcard, see below.
+> A **variable** names the terms that match at this position in the query. The variable can be mentioned elsewhere in the query; it doesn't usually make sense for a variable to be mentioned only once, since then you might as well just use a wildcard, see below.
 
 &nbsp;&nbsp;  `_`<br />
 
 > A wildcard; matches anything
+
+&nbsp;&nbsp;  `never`<br />
+
+> A pattern that always fails to match.
 
 &nbsp;&nbsp;*predicate*&nbsp;*term* [ `->` *term* ] <br />
 

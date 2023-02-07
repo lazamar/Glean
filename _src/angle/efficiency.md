@@ -59,7 +59,7 @@ predicate Child :
 We can try this out in the shell. First we have to create a new database to hold the derived facts that is *stacked* on top of the old database. Drop out of the shell and run this command to create the new database:
 
 ```lang=angle
-glean create --db-root /tmp/glean/db --db-schema dir:/tmp/glean/schema --repo derived/1 --stacked facts/1
+glean create --db-root /tmp/glean/db --schema dir:/tmp/glean/schema --db derived/1 --stacked facts/1
 ```
 
 Now start the shell again and load the stacked database. Note that we can still query facts from the original database:
@@ -130,14 +130,14 @@ Q where
 
 Generally speaking the statements are matched top-to-bottom. For each of the facts that match the first statement, bind the variables in the pattern and then proceed with the second statement, and so on.
 
-As written, this query works by *first* finding the parent of `Golfish` and *then* finding its parent, which is exactly what we want. This query will be efficient, because both stages are matching on the first field of the `example.Parent` predicate.
+As written, this query works by *first* finding the parent of `Goldfish` and *then* finding its parent, which is exactly what we want. This query will be efficient, because both stages are matching on the first field of the `example.Parent` predicate.
 
 If instead we swapped the order of the statements:
 
 ```lang=angle
 Q where
-    example.Parent { child = C, parent = Q }
-    example.Parent { child = { name = "Goldfish" }, parent = P };
+    example.Parent { child = P, parent = Q };
+    example.Parent { child = { name = "Goldfish" }, parent = P }
 ```
 
 The query still works, and means exactly the same thing, but it’s much less efficient. This query works as follows:

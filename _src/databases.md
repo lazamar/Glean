@@ -20,7 +20,7 @@ At Facebook, we have adopted an informal convention for database names: `<repo>.
 
 </FbInternalOnly>
 
-The name and hash together uniquely identify a database. This is written `<name>/<hash>`, and it is how you refer to a database in most cases when working with Glean. For example, in the shell's `:db` command, or the `--repo` argument to the command-line tools.
+The name and hash together uniquely identify a database. This is written `<name>/<hash>`, and it is how you refer to a database in most cases when working with Glean. For example, in the shell's `:db` command, or the `--db` argument to the command-line tools.
 
 ## Working with local databases
 
@@ -31,8 +31,12 @@ method is chosen by these command-line flags:
 
 * `--service <tier>` or `--service <host>:<port>`  Connect to a remote Glean server.
 * `--db-root <dir>`  Use databases stored locally in the directory `<dir>`
+* `--db-tmp` Create a temporary directory to store DBs and delete it
+  when the program exits.
+* `--db-memory` Store databases in memory rather than on disk.
 
-These flags are accepted by all the Glean command-line tools, including `glean`.
+These flags are accepted by all the Glean command-line tools,
+including `glean` and `glean-server`.
 
 <FbInternalOnly>
 

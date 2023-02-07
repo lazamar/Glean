@@ -90,7 +90,7 @@ detail in [Query Efficiency](efficiency.md).
 
 :::
 
-What other kinds of patterns can we use? Well, the simplest pattern is the wildcard, “_”, which matches anything.
+What other kinds of patterns can we use? Well, the simplest patterns are the wildcard, “_”, which matches anything, and "never", which always fails to match.
 
 ```lang=angle
 facts> example.Class _
@@ -98,6 +98,8 @@ facts> example.Class _
 { "id": 1027, "key": { "name": "Goldfish", "line": 40 } }
 { "id": 1025, "key": { "name": "Lizard", "line": 20 } }
 { "id": 1024, "key": { "name": "Pet", "line": 10 } }
+facts> example.Class never
+(no results)
 ```
 
 We’ll introduce more kinds of pattern in the following sections. The full list of patterns can be found in [Angle Reference](reference.md).
@@ -250,6 +252,28 @@ facts> example.Has { has = { method = { name = "feed" }} | { variable = _ }}
 (results omitted)
 ```
 
+## If-patterns
+
+We can conditionally match patterns using `if then else`.
+
+Variables matched in the condition will be available in the `then` branch.
+
+Whilst an or-pattern will always evaluate both of its branches, the `else` branch of an if-pattern will
+never be evaluated if the condition succeeds at least once.
+
+For example, we could get all child classes if inheritance is being used in the codebase, or
+retrieve all classes if it isn't.
+```
+facts > if (example.Parent { child = X }) then X else example.Class _
+  { "id": 1025, "key": { "name": "Lizard", "line": 20 } }
+  { "id": 1026, "key": { "name": "Fish", "line": 30 } }
+  { "id": 1027, "key": { "name": "Goldfish", "line": 40 } }
+```
+
+Please note that if-patterns cannot be used in stored derived predicates. This
+is the case because they require the use of negation, which is disallowed in
+stored predicates.
+
 ## More complex queries
 
 So far we’ve seen how to query for facts by matching patterns, including matching nested facts.  In this section we’ll see how to construct more complex queries that combine matching facts from multiple predicates.
@@ -374,6 +398,13 @@ We can also match the whole array with a pattern of the form `[ p1, p2, ... ]`
 
 ```lang=angle
 facts> X where [_,X,_] = [1,2,3]
+{ "id": 1040, "key": 2 }
+```
+
+Or if we don't care about the length of the array:
+
+```lang=angle
+facts> X where [_,X, ..] = [1,2,3]
 { "id": 1040, "key": 2 }
 ```
 

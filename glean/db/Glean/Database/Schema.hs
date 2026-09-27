@@ -466,6 +466,11 @@ mkDbSchema toList cacheVar knownPids dbContent
     either (throwIO . Thrift.Exception) return $
       checkStratification (tcEnvPredicates tcEnv)
 
+    -- Check that stored predicates don't involve recursion.
+    -- See Note [Recursion in stored predicates]
+    either (throwIO . Thrift.Exception) return $
+      checkStoredRecursion (tcEnvPredicates tcEnv)
+
     let
         predicates = snd <$> toList (tcEnvPredicates tcEnv)
 
@@ -1070,6 +1075,85 @@ checkStratification preds =
         where
         next =
           [ n | n <- depsOf p, sameComponent n to, not (HashSet.member n seen) ]
+
+    showPred = showRef . predicateIdRef
+
+{- Note [Recursion in stored predicates]
+
+Stored predicates can't be recursive, and can't depend on recursive
+predicates, for now:
+
+* A recursive stored predicate depends on itself, so it can never be
+  derived: deriving a stored predicate requires all its dependencies to
+  be complete (see checkConstraints in Glean.Query.Derive).
+
+* Ownership would be wrong. When a derived fact is created, its owners
+  are taken from the facts being searched at that point. A recursive
+  derivation searches facts derived earlier in the same query, and those
+  live in the query's FactSet, which has no ownership information
+  (FactSet::getOwner returns INVALID_USET). So the owners of the facts
+  they came from would be lost, and an incremental DB could keep derived
+  facts that it should have excluded. This applies to any stored
+  predicate whose derivation involves recursion, not just to recursive
+  stored predicates.
+
+Default derivations are left out: a pair of default derivations that
+refer to each other is never enabled at the same time, so they don't
+make the predicates depending on them recursive.
+-}
+
+-- | Check that stored predicates don't involve recursion.
+-- See Note [Recursion in stored predicates].
+checkStoredRecursion :: HashMap PredicateId PredicateDetails -> Either Text ()
+checkStoredRecursion preds =
+  unless (null violations) $ Left $ Text.unlines $
+    "recursion is not supported in stored predicates yet:"
+    : [ "  " <> showPred ref <> problem
+      | (ref, recPred) <- violations
+      , let problem
+              | ref == recPred = " is recursive"
+              | otherwise =
+                " depends on the recursive predicate " <> showPred recPred
+      ]
+  where
+    edges :: [(PredicateId, PredicateId, [PredicateId])]
+    edges =
+      [ (ref, ref, Set.toList (tcQueryDeps query))
+      | (ref, details) <- HashMap.toList preds
+      , Derive when (QueryWithInfo query _ _ _) <- [predicateDeriving details]
+      , case when of
+          DeriveIfEmpty -> False
+          DeriveOnDemand -> True
+          DerivedAndStored -> True
+      ]
+
+    deps :: HashMap PredicateId [PredicateId]
+    deps = HashMap.fromList [ (ref, ds) | (_, ref, ds) <- edges ]
+
+    depsOf :: PredicateId -> [PredicateId]
+    depsOf ref = HashMap.lookupDefault [] ref deps
+
+    -- For each predicate that involves recursion, a recursive predicate
+    -- that it depends on, which is the predicate itself if it is
+    -- recursive. Components come in reverse topological order, so the
+    -- dependencies of a component have been added by the time we get to it.
+    recursiveDep :: HashMap PredicateId PredicateId
+    recursiveDep = foldl' add mempty (stronglyConnComp edges)
+      where
+      add m = \case
+        CyclicSCC refs -> foldl' (\m' ref -> HashMap.insert ref ref m') m refs
+        AcyclicSCC ref ->
+          case firstJust (`HashMap.lookup` m) (depsOf ref) of
+            Nothing -> m
+            Just recPred -> HashMap.insert ref recPred m
+
+    violations :: [(PredicateId, PredicateId)]
+    violations = sort
+      [ (ref, recPred)
+      | (ref, details) <- HashMap.toList preds
+      , Derive DerivedAndStored _ <- [predicateDeriving details]
+      , Just recPred <- [HashMap.lookup ref recursiveDep]
+      ]
 
     showPred = showRef . predicateIdRef
 

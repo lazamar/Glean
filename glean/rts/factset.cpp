@@ -217,11 +217,14 @@ FactSet::seek(Pid type, folly::ByteRange start, size_t prefix_size) {
   if (const auto p = keys.lookup(type)) {
     auto& entry = index.value()[type];
     // Check if the entry is up to date (i.e., has the same number of items as
-    // the key hashmap). If it doesn't, fill it.
+    // the key hashmap). If it doesn't, add the missing facts. Facts are never
+    // removed, and inserting into a std::map doesn't invalidate iterators,
+    // so iterators from earlier seeks remain valid. This matters for
+    // recursive queries, which derive facts of a predicate while searching
+    // for facts of the same predicate.
     if (!entry.withRLock([&](auto& map) { return map.size() == p->size(); })) {
       entry.withWLock([&](auto& map) {
         if (map.size() != p->size()) {
-          map.clear();
           for (const Fact* fact : *p) {
             map.insert({fact->key(), fact});
           }

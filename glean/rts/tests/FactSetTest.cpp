@@ -378,6 +378,37 @@ TEST(FactSetTest, SeekIndexReflectsFactsAddedAfterFirstSeek) {
   EXPECT_EQ(collectKeys(*refreshedSeek), refreshedExpected);
 }
 
+// Recursive queries define facts of a predicate while a seek on the same
+// predicate is in progress, and then seek again.
+TEST(FactSetTest, SeekIteratorSurvivesFactsAddedDuringIteration) {
+  FactSet fs(Id::lowest());
+  unsigned char d1[] = "a1";
+  unsigned char d2[] = "a2";
+  unsigned char d3[] = "a3";
+  fs.define(Pid::lowest(), clauseFrom(d1, 2, 2));
+  fs.define(Pid::lowest(), clauseFrom(d3, 2, 2));
+
+  unsigned char prefix[] = "a";
+  auto outer =
+      fs.seek(Pid::lowest(), folly::ByteRange(prefix, 1), std::nullopt);
+  auto first = outer->get();
+  ASSERT_TRUE(first);
+  EXPECT_EQ(first.key().str(), "a1");
+
+  // Define a fact and seek again, which updates the index.
+  fs.define(Pid::lowest(), clauseFrom(d2, 2, 2));
+  auto inner =
+      fs.seek(Pid::lowest(), folly::ByteRange(prefix, 1), std::nullopt);
+  const std::vector<std::string> all{"a1", "a2", "a3"};
+  EXPECT_EQ(collectKeys(*inner), all);
+
+  // The first seek carries on from where it was, and sees the new fact
+  // because it comes later in key order.
+  outer->next();
+  const std::vector<std::string> rest{"a2", "a3"};
+  EXPECT_EQ(collectKeys(*outer), rest);
+}
+
 TEST(FactSetTest, FactsByDifferentPredicatesAreIndependent) {
   FactSet fs(Id::lowest());
   auto pid1 = Pid::lowest();

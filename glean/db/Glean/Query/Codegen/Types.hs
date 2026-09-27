@@ -89,13 +89,13 @@ data CgStatement_ var
     , else_ :: [CgStatement_ var]
     }
   | CgRec [(PidRef, CodegenQuery)]
-    -- ^ Derive all the facts of a component of recursive predicates.
-    -- There is a query for each predicate, returning the key and value
-    -- of its facts. We run the queries and create facts from their
-    -- results until they stop producing new facts. Each query has its
-    -- own variables, and none of them are visible to the statements
-    -- that follow.
-    -- See Note [Evaluating recursive predicates] in Glean.Query.Flatten.
+    -- ^ Derive the facts of recursive predicates that have been
+    -- demanded. There is a query for each predicate and binding pattern,
+    -- returning the key and value of its demanded facts. We run the
+    -- queries and create facts from their results until they stop
+    -- producing new facts. Each query has its own variables, and none of
+    -- them are visible to the statements that follow.
+    -- See Note [Evaluating recursive predicates] in Glean.Query.Recursion.
   deriving (Show, Functor, Foldable, Traversable)
 
 

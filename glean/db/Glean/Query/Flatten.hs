@@ -8,13 +8,13 @@
 
 module Glean.Query.Flatten
   ( flatten
+  , flattenDerivation
   ) where
 
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.State
 import qualified Data.HashMap.Strict as HashMap
-import qualified Data.IntMap as IntMap
 import Data.List hiding (intersect)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NonEmpty
@@ -48,27 +48,22 @@ import Glean.Schema.Util
 -- | Turn 'TypecheckedQuery' into 'FlattenedQuery', by lifting out
 -- nested generators into statements.
 --
--- Calls to recursive predicates become searches for their facts, and we
--- also return the queries that derive those facts: one list per
--- component of recursive predicates, in dependency order. See
--- Note [Evaluating recursive predicates].
+-- Calls to recursive predicates become searches for their facts. See
+-- Note [Evaluating recursive predicates] in Glean.Query.Recursion.
 flatten
   :: EnableRecursion
   -> DbSchema
   -> Schema.AngleVersion
   -> Bool -- ^ derive DerivedAndStored predicates
   -> TypecheckedQuery
-  -> Except Text (FlattenedQuery, [[(PidRef, FlattenedQuery)]])
+  -> Except Text FlattenedQuery
 flatten rec dbSchema ver deriveStored QueryWithInfo{..} =
   fmap fst $ flip runStateT state $ do
     (flattened, maybeLookup, returnType) <- do
       flat <- flattenQuery qiQuery `catchError` flattenFailure
       captureKey ver dbSchema flat (case qiQuery of TcQuery ty _ _ _ _ -> ty)
-    derivations <- flattenRecursiveComponents
     nextVar <- gets flNextVar
-    return
-      ( QueryWithInfo flattened nextVar maybeLookup returnType
-      , derivations )
+    return $ QueryWithInfo flattened nextVar maybeLookup returnType
   where
       state = initialFlattenState rec dbSchema qiNumVars deriveStoredPred
 
@@ -300,104 +295,82 @@ flattenFactGen pidRef@(PidRef pid _) rng kpat vpat = do
         Schema.Derive when query
           | derive == Just predicateId -> expand query
           | Schema.DerivedAndStored <- when -> search
-          | Just component <-
-              HashMap.lookup predicateId (recursiveComponents dbSchema) -> do
-            refersToRecursive predicateId component
+          | HashMap.member predicateId (recursiveComponents dbSchema) -> do
+            refersToRecursive predicateId
             search
           | otherwise -> expand query
 
--- | Record that the query refers to a recursive predicate, so the facts
--- of its component must be derived first.
-refersToRecursive :: Schema.PredicateId -> RecursiveComponent -> F ()
-refersToRecursive ref component = do
+-- | A call to a recursive predicate is a search for its facts, which are
+-- derived after reordering (see Note [Evaluating recursive predicates]
+-- in Glean.Query.Recursion).
+refersToRecursive :: Schema.PredicateId -> F ()
+refersToRecursive ref = do
   recursion <- gets flRecursion
   case recursion of
     DisableRecursion ->
       throwError $ "recursive reference to predicate " <>
         Text.pack (show (displayDefault ref))
-    EnableRecursion ->
-      modify $ \state -> state
-        { flRecursiveComponents = IntMap.insert (componentIndex component)
-            component (flRecursiveComponents state)
-        }
+    EnableRecursion -> return ()
 
-{- Note [Evaluating recursive predicates]
-
-A call to a derived predicate is normally expanded into the statements
-of its derivation. That doesn't work for a recursive predicate, because
-the expansion would never end. Instead:
-
-* A call to a recursive predicate is a search for its facts, like a call
-  to a stored predicate.
-
-* Before the query runs, we derive all the facts of each component of
-  recursive predicates that it refers to (see 'RecursiveComponent'),
-  in dependency order. For each member of a component we flatten a query
-  that returns the key and value of each of its facts: its derivation
-  expanded once. References to members of the component inside the
-  derivation are searches for the facts derived so far. We run the
-  queries of all members of a component repeatedly, creating a fact for
-  each result, until a round derives no new facts (see CgRec in
-  Glean.Query.Codegen).
-
-  The facts are created from the results rather than by a statement of
-  the query, because the statement could be reordered before a filter
-  and create facts that aren't true (see Note [Writing derived facts] in
-  Glean.Query.UserQuery). Those facts would then be used to derive more.
-
-Deriving complete relations is correct whatever the call site binds,
-works for mutually recursive predicates, and makes a negated recursive
-predicate complete before it is negated, since stratification (see
-Note [Stratification] in Glean.Database.Schema) guarantees that it is in
-a lower component. But it derives facts that the query may not need;
-using what the call site binds to restrict what is derived is left for
-later.
--}
-
--- | Flatten the queries deriving the facts of the recursive predicates
--- that the query refers to, one list per component, in dependency order.
--- Flattening them may refer to more components.
-flattenRecursiveComponents :: F [[(PidRef, FlattenedQuery)]]
-flattenRecursiveComponents = go IntMap.empty
-  where
-  go done = do
-    referred <- gets flRecursiveComponents
-    case IntMap.lookupMin (referred `IntMap.difference` done) of
-      Nothing -> return (IntMap.elems done)
-      Just (n, component) -> do
-        derivations <- mapM flattenDerivation (componentMembers component)
-        go (IntMap.insert n derivations done)
-
--- | The query returning the key and value of every fact of a recursive
--- predicate:
+-- | The query returning the key and value of each fact of a recursive
+-- predicate that matches a demand (see Note [Evaluating recursive
+-- predicates] in Glean.Query.Recursion):
 --
--- > { Key, Value } where <derivation of P>
+-- > { Key, Value } where
+-- >   Demand { X.. };
+-- >   <derivation of P, with the bound fields of its key set to X..>
 --
-flattenDerivation :: Schema.PredicateId -> F (PidRef, FlattenedQuery)
-flattenDerivation ref = do
-  dbSchema <- gets flDbSchema
-  PredicateDetails{..} <- case lookupPredicateId ref dbSchema of
-    Nothing -> internalError
-    Just details -> return details
-  let pidRef = PidRef predicatePid predicateId
-  modify $ \state -> state { flDerive = Just predicateId }
-  (stmts, gen) <- flattenFactGen pidRef SeekOnAllFacts
-    (Ref (MatchWild predicateKeyType))
-    (Ref (MatchWild predicateValueType))
-  (key, val) <- case gen of
-    DerivedFactGenerator _ key val -> return (key, val)
-    _ -> internalError
-  nextVar <- gets flNextVar
-  return (pidRef, QueryWithInfo
-    { qiQuery = FlatQuery (Tuple [key, val]) Nothing (asGroup stmts)
-    , qiNumVars = nextVar
-    , qiGenerator = Nothing
-    , qiReturnType = tupleSchema [predicateKeyType, predicateValueType]
-    })
+flattenDerivation
+  :: DbSchema
+  -> Schema.PredicateId
+  -> PidRef -- ^ the Demand predicate
+  -> [Bool] -- ^ which fields of the key the demand binds
+  -> Except Text FlattenedQuery
+flattenDerivation dbSchema ref demand bound =
+  flip evalStateT state $ do
+    PredicateDetails{..} <- getPredicateDetails ref
+    let pidRef = PidRef predicatePid predicateId
+    (keyPat, demandPat) <- demandPatterns predicateKeyType bound
+    (stmts, gen) <- flattenFactGen pidRef SeekOnAllFacts keyPat
+      (Ref (MatchWild predicateValueType))
+    (key, val) <- case gen of
+      DerivedFactGenerator _ key val -> return (key, val)
+      _ -> throwError $ "internal error: flattenDerivation: " <>
+        Text.pack (show (displayDefault ref))
+    nextVar <- gets flNextVar
+    let
+      demandTy = Angle.PredicateTy () demand
+      demandStmt = FlatStatement demandTy (Ref (MatchWild demandTy))
+        (FactGenerator demand demandPat (Tuple []) SeekOnAllFacts)
+    return QueryWithInfo
+      { qiQuery = FlatQuery (Tuple [key, val]) Nothing $
+          mkStatementGroup (Floating demandStmt : flattenStmts stmts)
+      , qiNumVars = nextVar
+      , qiGenerator = Nothing
+      , qiReturnType = tupleSchema [predicateKeyType, predicateValueType]
+      }
   where
-  internalError :: F a
-  internalError = throwError $ "internal error: flattenDerivation: " <>
-    Text.pack (show (displayDefault ref))
+  state = initialFlattenState EnableRecursion dbSchema 0 (Just ref)
+
+-- | Patterns for the key of a predicate and for the key of a demand for
+-- it, where the bound fields of the key are variables bound by the
+-- demand.
+demandPatterns :: Type -> [Bool] -> F (Pat, Pat)
+demandPatterns keyTy bound = case derefType keyTy of
+  Angle.RecordTy fields | length fields == length bound -> do
+    vars <- forM (zip fields bound) $ \(Angle.FieldDef _ ty, isBound) ->
+      if isBound then Just <$> fresh ty else return Nothing
+    return
+      ( Tuple
+          [ maybe (Ref (MatchWild ty)) (Ref . MatchVar) var
+          | (Angle.FieldDef _ ty, var) <- zip fields vars ]
+      , Tuple [ Ref (MatchBind var) | Just var <- vars ]
+      )
+  _ | and bound -> do
+      var <- fresh keyTy
+      return (Ref (MatchVar var), Ref (MatchBind var))
+    | otherwise ->
+      return (Ref (MatchWild keyTy), Tuple [])
 
 -- | Returns a list of statement*pattern pairs
 --   representing a disjunction @(P1 where S1 | P2 where S2 | ...)@

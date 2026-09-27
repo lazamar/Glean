@@ -35,8 +35,6 @@ module Glean.Query.Flatten.Types
 
 import Control.Monad.Except
 import Control.Monad.State
-import Data.IntMap (IntMap)
-import qualified Data.IntMap as IntMap
 import qualified Data.IntSet as IntSet
 import Data.Text (Text)
 import Compat.Prettyprinter hiding ((<>))
@@ -284,9 +282,6 @@ data FlattenState = FlattenState
     -- first reference is expanded, so recursive references search for
     -- the facts derived so far.
   , flRecursion :: EnableRecursion
-  , flRecursiveComponents :: IntMap RecursiveComponent
-    -- ^ Components of recursive predicates that the query refers to,
-    -- by index. Their facts must be derived before the query runs.
   }
 
 getPredicateDetails :: PredicateId -> F PredicateDetails
@@ -307,7 +302,6 @@ initialFlattenState rec dbSchema nextVar derive = FlattenState
   , flNextVar = nextVar
   , flDerive = derive
   , flRecursion = rec
-  , flRecursiveComponents = IntMap.empty
   }
 
 type F a = StateT FlattenState (Except Text) a

@@ -10,8 +10,11 @@
 module Angle.RecursionTest (main) where
 
 import Control.Exception
+import qualified Data.ByteString.Char8 as BC
 import Data.Default (def)
 import Data.List (isInfixOf, sort)
+import qualified Data.Map as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text, unpack)
 import Test.HUnit
 
@@ -462,6 +465,84 @@ recursionTest = TestList
             assertBool (unpack err) $
               "reached one of its limits" `isInfixOf` unpack err
           Right _ -> assertFailure "query succeeded"
+
+  , TestLabel "input from the call site" $ TestCase $ do
+    -- The design doc's bounded recursion: Max only comes from the call
+    -- site, so the facts can only be derived for the demanded Max.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate BoundedPath :
+            { from: Node, to: Node, distance: nat, max: nat }
+            { From, To, Distance, Max } where
+              (x.Edge { From, To }; Distance = 1) |
+              ( x.BoundedPath { From, K, D, Max };
+                D < Max;
+                x.Edge { K, To };
+                Distance = D + 1 )
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 1
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 1 } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        facts <- decodeResultsAs "x.BoundedPath.1" schema =<< runQ env repo
+          [s| x.BoundedPath { 1, _, _, 2 } |]
+        assertEqual "result content"
+          [ RTS.Tuple [ RTS.Nat 1, RTS.Nat 2, RTS.Nat 1, RTS.Nat 2 ]
+          , RTS.Tuple [ RTS.Nat 1, RTS.Nat 3, RTS.Nat 2, RTS.Nat 2 ]
+          ]
+          (sort facts)
+
+  , TestLabel "only derives what the call needs" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3, and 10 -> 11 -> ... -> 40, which isn't reachable
+      -- from 1
+      [ mkBatch (PredicateRef "x.Edge" 1) $
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          ] <>
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [10 .. 39 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        response <- runQ env repo [s| x.Path { 1, _ } |]
+        facts <- decodeResultsAs "x.Path.1" schema response
+        assertEqual "result content"
+          [ RTS.Tuple [ RTS.Nat 1, RTS.Nat 2 ]
+          , RTS.Tuple [ RTS.Nat 1, RTS.Nat 3 ]
+          ]
+          (sort facts)
+        edge <- either (assertFailure . unpack) (return . predicatePid) $
+          lookupPredicateSourceRef (parseRef "x.Edge.1") LatestSchema schema
+        let
+          searched = case response of
+            Right UserQueryResults{..} -> fromMaybe 0 $ do
+              stats <- userQueryResults_stats
+              counts <- userQueryStats_facts_searched stats
+              Map.lookup (fromIntegral (RTS.fromPid edge)) counts
+            Left _ -> 0
+        assertBool ("Edge facts searched: " <> show searched) $
+          searched > 0 && searched < 30
   ]
 
   where

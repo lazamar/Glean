@@ -13,6 +13,7 @@ module Glean.Database.Schema.Types
   , RefTargetId
   , PredicateDetails(..)
   , predicateRef
+  , RecursiveComponent(..)
   , PredicateTransformation(..)
   , Bytes(..)
   , IsPointQuery
@@ -76,6 +77,9 @@ import Glean.Schema.Util
 data DbSchema = DbSchema
   { predicatesById :: HashMap PredicateId PredicateDetails
   , derivationDepends :: HashMap PredicateId [PredicateId]
+  , recursiveComponents :: HashMap PredicateId RecursiveComponent
+    -- ^ The derived predicates that are recursive, and the component of
+    -- recursive predicates that each one belongs to.
   , typesById :: HashMap TypeId TypeDetails
 
   , schemaEnvs :: Map SchemaId (NameEnv RefTargetId)
@@ -178,6 +182,18 @@ data PredicateDetails = PredicateDetails
 
 predicateRef :: PredicateDetails -> PredicateRef
 predicateRef = predicateIdRef . predicateId
+
+-- | A group of derived predicates whose derivations depend on each
+-- other, directly or through other predicates of the group. That is, a
+-- strongly connected component of the derivation graph that contains a
+-- cycle.
+data RecursiveComponent = RecursiveComponent
+  { componentIndex :: Int
+    -- ^ Components are numbered in dependency order: a component only
+    -- depends on components with a lower index.
+  , componentMembers :: [PredicateId]
+  }
+  deriving (Eq, Show)
 
 data SchemaSelector
   = LatestSchema

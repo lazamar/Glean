@@ -380,6 +380,8 @@ mkDbSchema toList cacheVar knownPids dbContent
   return $ schema {
     predicatesById = byId,
     predicatesByPid = byPid,
+    -- pruning and enabling default derivations changes the dependencies
+    recursiveComponents = recursiveComponentsOf byId,
     predicatesTransformations =
       mkQueryTransformations byPid <$> transformations
   }
@@ -525,6 +527,7 @@ mkDbSchema toList cacheVar knownPids dbContent
       , schemaAllVersion = hashedSchemaAllVersion latestSchema
       , schemaId = hashedSchemaId latestSchema
       , derivationDepends = derivationDepends
+      , recursiveComponents = recursiveComponentsOf predicatesById
       }
 
 mkTransformations
@@ -986,6 +989,20 @@ derivationEdges preds =
   , Derive _ (QueryWithInfo query _ _ _)  <- [predicateDeriving details]
   ]
 
+-- | The recursive derived predicates, and the component each belongs to.
+recursiveComponentsOf
+  :: HashMap PredicateId PredicateDetails
+  -> HashMap PredicateId RecursiveComponent
+recursiveComponentsOf preds = HashMap.fromList
+  [ (ref, RecursiveComponent n (sort refs))
+  -- stronglyConnComp returns components in reverse topological order,
+  -- so each component comes after the components it depends on.
+  | (n, CyclicSCC refs) <- zip [0..] (stronglyConnComp edges)
+  , ref <- refs
+  ]
+  where
+  edges = [ (ref, ref, deps) | (_, ref, deps) <- derivationEdges preds ]
+
 {- Note [Stratification]
 
 With recursive derivations, a predicate could be defined in terms of its
@@ -1038,13 +1055,7 @@ checkStratification preds =
 
     -- the recursive component that each recursive predicate belongs to
     componentOf :: HashMap PredicateId Int
-    componentOf = HashMap.fromList
-      [ (ref, n)
-      | (n, CyclicSCC refs) <- zip [0..] components
-      , ref <- refs
-      ]
-      where
-      components = stronglyConnComp [ (ref, ref, ds) | (_, ref, ds) <- edges ]
+    componentOf = componentIndex <$> recursiveComponentsOf preds
 
     sameComponent a b =
       isJust (HashMap.lookup a componentOf)

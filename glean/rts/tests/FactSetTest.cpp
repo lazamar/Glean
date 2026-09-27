@@ -468,21 +468,72 @@ TEST(FactSetTest, SeekWithinSectionFullRangeWorks) {
   EXPECT_EQ(count, 2);
 }
 
-TEST(FactSetTest, SeekWithinSectionRejectsNarrowBounds) {
+TEST(FactSetTest, SeekWithinSectionNarrowBoundsWithPrefix) {
   FactSet fs(Id::lowest());
   unsigned char d1[] = "abc";
   unsigned char d2[] = "abd";
+  unsigned char d3[] = "abe";
+  unsigned char d4[] = "xyz";
   fs.define(Pid::lowest(), clauseFrom(d1, 3, 3));
+  auto id2 = fs.define(Pid::lowest(), clauseFrom(d2, 3, 3));
+  fs.define(Pid::lowest(), clauseFrom(d3, 3, 3));
+  fs.define(Pid::lowest(), clauseFrom(d4, 3, 3));
+
+  unsigned char prefix[] = "ab";
+  auto iter = fs.seekWithinSection(
+      Pid::lowest(), folly::ByteRange(prefix, 2), id2, id2 + 2, std::nullopt);
+  const std::vector<std::string> expected{"abd", "abe"};
+  EXPECT_EQ(collectKeys(*iter), expected);
+}
+
+TEST(FactSetTest, SeekWithinSectionNarrowBoundsWithoutPrefix) {
+  FactSet fs(Id::lowest());
+  unsigned char d1[] = "a";
+  unsigned char d2[] = "b";
+  unsigned char d3[] = "c";
+  unsigned char d4[] = "d";
+  unsigned char d5[] = "e";
+  auto other = Pid::lowest() + 1;
+  fs.define(Pid::lowest(), clauseFrom(d1, 1, 1));
+  auto id2 = fs.define(Pid::lowest(), clauseFrom(d2, 1, 1));
+  fs.define(other, clauseFrom(d3, 1, 1));
+  fs.define(Pid::lowest(), clauseFrom(d4, 1, 1));
+  fs.define(Pid::lowest(), clauseFrom(d5, 1, 1));
+
+  // fewer facts in the range than facts of the predicate
+  auto narrow = fs.seekWithinSection(
+      Pid::lowest(), folly::ByteRange(), id2, id2 + 3, std::nullopt);
+  const std::vector<std::string> narrowExpected{"b", "d"};
+  EXPECT_EQ(collectKeys(*narrow), narrowExpected);
+
+  // more facts in the range than facts of the predicate
+  auto wide = fs.seekWithinSection(
+      other, folly::ByteRange(), Id::lowest(), id2 + 3, std::nullopt);
+  const std::vector<std::string> wideExpected{"c"};
+  EXPECT_EQ(collectKeys(*wide), wideExpected);
+
+  // nothing in the range
+  auto empty = fs.seekWithinSection(
+      other, folly::ByteRange(), id2 + 2, id2 + 4, std::nullopt);
+  EXPECT_EQ(collectKeys(*empty), std::vector<std::string>{});
+}
+
+TEST(FactSetTest, SeekWithinSectionCantRestartNarrowBounds) {
+  FactSet fs(Id::lowest());
+  unsigned char d1[] = "abc";
+  unsigned char d2[] = "abd";
+  auto id1 = fs.define(Pid::lowest(), clauseFrom(d1, 3, 3));
   fs.define(Pid::lowest(), clauseFrom(d2, 3, 3));
 
   unsigned char prefix[] = "ab";
+  auto restart = fs.enumerate(id1, id1 + 1)->get();
   EXPECT_THROW(
       fs.seekWithinSection(
           Pid::lowest(),
           folly::ByteRange(prefix, 2),
           Id::lowest(),
           Id::lowest() + 1,
-          std::nullopt),
+          restart),
       std::runtime_error);
 }
 

@@ -272,10 +272,28 @@ std::unique_ptr<FactIterator> FactSet::seekWithinSection(
     return seek(type, prefix, restart);
   }
 
-  // We have no use case for actually performing a bounded
-  // seek of a FactSet, therefore we would rather know if
-  // anything tries to trigger it.
-  error("FactSet::seekWithinSection: bounds too narrow");
+  // Recursive queries search for the facts derived in particular rounds of
+  // their evaluation, which are the facts in a range of ids.
+  if (restart.has_value()) {
+    error("FactSet::seekWithinSection: can't restart a bounded seek");
+  }
+  const auto count = keys.lookup(type) ? keys.lookup(type)->size() : 0;
+  const auto lo = std::max(from, startingId());
+  const auto hi = std::min(to, firstFreeId());
+  if (count == 0 || hi <= lo) {
+    return std::make_unique<EmptyIterator>();
+  }
+  if (prefix.empty() && distance(lo, hi) < count) {
+    // The facts in the range are contiguous, so when there are fewer of them
+    // than facts of the predicate, look at those.
+    return FactIterator::filter(enumerate(lo, hi), [this, type](Id id) {
+      return typeById(id) == type;
+    });
+  } else {
+    return FactIterator::filter(
+        seek(type, prefix, prefix.size()),
+        [lo, hi](Id id) { return lo <= id && id < hi; });
+  }
 }
 
 Id FactSet::define(Pid type, Fact::Clause clause, Id) {

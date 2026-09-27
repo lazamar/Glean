@@ -340,8 +340,9 @@ flattenDerivation dbSchema ref demand bound =
     nextVar <- gets flNextVar
     let
       demandTy = Angle.PredicateTy () demand
+      -- see Note [Semi-naive evaluation] in Glean.Query.Recursion
       demandStmt = FlatStatement demandTy (Ref (MatchWild demandTy))
-        (FactGenerator demand demandPat (Tuple []) SeekOnAllFacts)
+        (FactGenerator demand demandPat (Tuple []) SeekOnRound)
     return QueryWithInfo
       { qiQuery = FlatQuery (Tuple [key, val]) Nothing $
           mkStatementGroup (Floating demandStmt : flattenStmts stmts)

@@ -10,12 +10,16 @@
 module Angle.RecursionTest (main) where
 
 import Control.Exception
+import Control.Monad (forM_)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Default (def)
 import Data.Int (Int64)
 import Data.List (isInfixOf, sort)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
+import Data.Set (Set)
+import qualified Data.Set as Set
 import Data.Text (Text, unpack)
 import Test.HUnit
 
@@ -25,6 +29,7 @@ import Util.String.Quasi
 import Glean.Angle.Types (AngleVersion(..), Type_(NatTy), latestAngleVersion)
 import Glean.Database.Schema.Types
 import Glean.Database.Config (Config(..))
+import Glean.Database.Types (Env)
 import Glean.Init
 import Glean (userQuery)
 import qualified Glean.RTS.Term as RTS
@@ -628,45 +633,46 @@ recursionTest = TestList
         assertEqual "Edge facts searched" (searched once) (searched repeated)
   ]
 
-  where
-    decodeNats response =
-      decodeResults NatTy userQueryResultsBin_facts response
-        >>= either assertFailure return
+decodeNats :: Either BadQuery UserQueryResults -> IO [RTS.Value]
+decodeNats response =
+  decodeResults NatTy userQueryResultsBin_facts response
+    >>= either assertFailure return
 
-    runQ env repo query =
-      try $ userQuery env repo $ def
-        { userQuery_query = query
-        , userQuery_options = Just def
-          { userQueryOptions_syntax = QuerySyntax_ANGLE
-          , userQueryOptions_recursive = True
-          , userQueryOptions_collect_facts_searched = True
-          , userQueryOptions_debug = def
-            { queryDebugOptions_bytecode = False
-            , queryDebugOptions_ir = False
-            }
-          }
-        , userQuery_encodings = [ UserQueryEncoding_bin def ]
+runQ :: Env -> Repo -> ByteString -> IO (Either BadQuery UserQueryResults)
+runQ env repo query =
+  try $ userQuery env repo $ def
+    { userQuery_query = query
+    , userQuery_options = Just def
+      { userQueryOptions_syntax = QuerySyntax_ANGLE
+      , userQueryOptions_recursive = True
+      , userQueryOptions_collect_facts_searched = True
+      , userQueryOptions_debug = def
+        { queryDebugOptions_bytecode = False
+        , queryDebugOptions_ir = False
         }
+      }
+    , userQuery_encodings = [ UserQueryEncoding_bin def ]
+    }
 
-    decodeResultsAs
-      :: Text
-      -> DbSchema
-      -> Either BadQuery UserQueryResults
-      -> IO [RTS.Value]
-    decodeResultsAs ref schema eresults = do
-      res <- decodeResults
-        (keyType (parseRef ref) schema) userQueryResultsBin_facts eresults
-      either assertFailure return res
-      where
-      keyType
-        :: SourceRef
-        -> DbSchema
-        -> RTS.Type
-      keyType ref dbSchema =
-        case lookupPredicateSourceRef ref LatestSchema dbSchema of
-          Left err -> error $ "can't find predicate: " <>
-            unpack (showRef ref) <> ": " <> unpack err
-          Right details -> predicateKeyType details
+decodeResultsAs
+  :: Text
+  -> DbSchema
+  -> Either BadQuery UserQueryResults
+  -> IO [RTS.Value]
+decodeResultsAs ref schema eresults = do
+  res <- decodeResults
+    (keyType (parseRef ref) schema) userQueryResultsBin_facts eresults
+  either assertFailure return res
+  where
+  keyType
+    :: SourceRef
+    -> DbSchema
+    -> RTS.Type
+  keyType ref dbSchema =
+    case lookupPredicateSourceRef ref LatestSchema dbSchema of
+      Left err -> error $ "can't find predicate: " <>
+        unpack (showRef ref) <> ": " <> unpack err
+      Right details -> predicateKeyType details
 
 stratificationTest :: Test
 stratificationTest = TestList
@@ -818,6 +824,88 @@ storedTest = TestList
       (either (assertFailure . show) return)
   ]
 
+-- | Compare the results of recursive queries with a reference
+-- implementation, on a few pseudo-random graphs.
+referenceTest :: Test
+referenceTest = TestList
+  [ TestLabel ("graph " <> show n) $ TestCase $ checkGraph nodes edges
+  | (n, (seed, nodes, size)) <- zip [1 :: Int ..] graphs
+  , let edges = randomGraph seed nodes size
+  ]
+  where
+  -- (seed, number of nodes, number of edges)
+  graphs = [ (1, 6, 8), (2, 8, 14), (3, 10, 12), (4, 5, 12) ]
+
+  -- the same relation defined in three ways
+  predicates = [ "x.Left.1", "x.Right.1", "x.NonLinear.1" ]
+
+  checkGraph nodes edges =
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Left : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Left { A, K }; x.Edge { K, B })
+          predicate Right : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Edge { A, K }; x.Right { K, B })
+          predicate NonLinear : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.NonLinear { A, K }; x.NonLinear { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show a) <>
+            ", \"to\": " <> BC.pack (show b) <> " } }"
+          | (a, b) <- edges
+          ]
+      ]
+      $ \env repo schema -> do
+        let
+          expected = closure edges
+          check predicate query want = do
+            facts <- decodeResultsAs predicate schema =<<
+              runQ env repo (BC.pack (unpack predicate <> " " <> query))
+            assertEqual (unpack predicate <> " " <> query)
+              (Set.toList want) (sort (map pair facts))
+        forM_ predicates $ \predicate -> do
+          check predicate "_" expected
+          forM_ [1 .. nodes] $ \a ->
+            check predicate ("{ " <> show a <> ", _ }") $
+              Set.filter ((== a) . fst) expected
+          forM_ [1 .. nodes] $ \b ->
+            check predicate ("{ _, " <> show b <> " }") $
+              Set.filter ((== b) . snd) expected
+
+  pair (RTS.Tuple [RTS.Nat a, RTS.Nat b]) = (fromIntegral a, fromIntegral b)
+  pair v = error ("unexpected result: " <> show v)
+
+-- | Pseudo-random edges between nodes 1..n, from a linear congruential
+-- generator so that the graphs are the same on every run. Its low bits
+-- are far from random, so we use the high ones.
+randomGraph :: Int -> Int -> Int -> [(Int, Int)]
+randomGraph seed nodes size = Set.toList $ Set.fromList $ take size $
+  pairs (map node (drop 1 (iterate next seed)))
+  where
+  next x = (x * 1103515245 + 12345) `mod` 2147483648
+  node x = 1 + (x `div` 65536) `mod` nodes
+  pairs (a : b : rest) = (a, b) : pairs rest
+  pairs _ = []
+
+-- | The transitive closure of a set of edges.
+closure :: [(Int, Int)] -> Set (Int, Int)
+closure edges = go (Set.fromList edges)
+  where
+  go paths
+    | paths' == paths = paths
+    | otherwise = go paths'
+    where
+    paths' = Set.union paths $ Set.fromList
+      [ (a, c) | (a, b) <- Set.toList paths, (b', c) <- edges, b == b' ]
+
 assertRejected :: String -> Either SomeException () -> IO ()
 assertRejected expected r = case r of
   Left err ->
@@ -830,4 +918,5 @@ main = withUnitTest $ testRunner $ TestList
   [ TestLabel "recursion" recursionTest
   , TestLabel "stratification" stratificationTest
   , TestLabel "stored predicates" storedTest
+  , TestLabel "reference" referenceTest
   ]

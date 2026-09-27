@@ -360,7 +360,9 @@ struct FactSet final : public Define {
 
   /// The ids of the facts of each predicate, in increasing order. We use it
   /// to find the facts added since the seek index of a predicate was last
-  /// brought up to date. It is initialised lazily and then kept up to date
+  /// brought up to date, and the facts of a predicate within a range of ids
+  /// (recursive queries use that to find the facts derived in a round of
+  /// their evaluation). It is initialised lazily and then kept up to date
   /// with the facts added since.
   struct IdIndex;
   OnDemand<IdIndex> id_index;
@@ -369,6 +371,8 @@ struct FactSet final : public Define {
   /// id index up to date first. Null if there are none.
   const std::vector<Id>* idsOf(Pid type);
 
+  /// The facts of a predicate with ids in [from, to)
+  std::unique_ptr<FactIterator> factsWithin(Pid type, Id from, Id to);
 
   std::unique_ptr<FactIterator>
   seek(Pid type, folly::ByteRange start, size_t prefix_size);

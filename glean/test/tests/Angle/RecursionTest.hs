@@ -18,7 +18,7 @@ import Test.HUnit
 import TestRunner
 import Util.String.Quasi
 
-import Glean.Angle.Types (AngleVersion(..), latestAngleVersion)
+import Glean.Angle.Types (AngleVersion(..), Type_(NatTy), latestAngleVersion)
 import Glean.Database.Schema.Types
 import Glean.Database.Config (Config(..))
 import Glean.Init
@@ -259,9 +259,216 @@ recursionTest = TestList
           , RTS.Tuple [ RTS.Nat 3, RTS.Nat 4 ]
           ]
           (sort facts)
+
+  , TestLabel "left recursion with the last field bound" $ TestCase $ do
+    -- Deriving Path { _, 4 } needs Path facts that don't end in 4.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        facts <- decodeResultsAs "x.Path.1" schema =<< runQ env repo
+          [s| x.Path { _, 4 } |]
+        assertEqual "result content"
+          [ RTS.Tuple [ RTS.Nat 1, RTS.Nat 4 ]
+          , RTS.Tuple [ RTS.Nat 2, RTS.Nat 4 ]
+          , RTS.Tuple [ RTS.Nat 3, RTS.Nat 4 ]
+          ]
+          (sort facts)
+
+  , TestLabel "two calls to a recursive predicate" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        nodes <- decodeNats =<< runQ env repo
+          [s| X where x.Path { 1, X }; x.Path { X, 4 } |]
+        assertEqual "nodes between 1 and 4" [ RTS.Nat 2, RTS.Nat 3 ]
+          (sort nodes)
+
+  , TestLabel "mutual recursion" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          predicate P : nat
+          predicate Q : nat
+          predicate R : nat
+            A where x.P A | x.S A
+          predicate S : nat
+            A where x.Q A | x.R A
+        }
+        schema all.1 : x.1 {}
+      |]
+      [ mkBatch (PredicateRef "x.P" 1) [ [s|{ "key": 1 }|] ]
+      , mkBatch (PredicateRef "x.Q" 1) [ [s|{ "key": 2 }|] ]
+      ]
+      $ \env repo schema -> do
+        r <- decodeResultsAs "x.R.1" schema =<< runQ env repo [s| x.R _ |]
+        assertEqual "R" [ RTS.Nat 1, RTS.Nat 2 ] (sort r)
+        s <- decodeResultsAs "x.S.1" schema =<< runQ env repo [s| x.S _ |]
+        assertEqual "S" [ RTS.Nat 1, RTS.Nat 2 ] (sort s)
+
+  , TestLabel "cyclic data" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 <-> 2
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 1 } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        facts <- decodeResultsAs "x.Path.1" schema =<< runQ env repo
+          [s| x.Path _ |]
+        assertEqual "result content"
+          [ RTS.Tuple [ RTS.Nat 1, RTS.Nat 1 ]
+          , RTS.Tuple [ RTS.Nat 1, RTS.Nat 2 ]
+          , RTS.Tuple [ RTS.Nat 2, RTS.Nat 1 ]
+          , RTS.Tuple [ RTS.Nat 2, RTS.Nat 2 ]
+          ]
+          (sort facts)
+
+  , TestLabel "negation of a recursive predicate" $ TestCase $ do
+    -- The design doc's example: routes that need a flight because there
+    -- is no land route.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Town = nat
+          predicate Road : { begin : Town, end : Town }
+          predicate FlightRoute : { from : Town, to : Town }
+          predicate LandRoute : { from : Town, to : Town }
+            { From, To } where
+              x.Road { From, To } |
+              (x.LandRoute { From, X }; x.Road { X, To })
+          predicate NeedsFlying : { from : Town, to : Town }
+            { From, To } where
+              !(x.LandRoute { From, To });
+              x.FlightRoute { From, To } |
+              (x.NeedsFlying { From, X }; x.FlightRoute { X, To })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- roads 1 -> 2 -> 3, flights 1 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Road" 1)
+          [ [s|{ "key": { "begin": 1, "end": 2 } }|]
+          , [s|{ "key": { "begin": 2, "end": 3 } }|]
+          ]
+      , mkBatch (PredicateRef "x.FlightRoute" 1)
+          [ [s|{ "key": { "from": 1, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        facts <- decodeResultsAs "x.NeedsFlying.1" schema =<< runQ env repo
+          [s| x.NeedsFlying _ |]
+        -- 1 -> 3 can be done by land, and every route from 1 to 4
+        -- goes through 1 -> 3
+        assertEqual "result content"
+          [ RTS.Tuple [ RTS.Nat 3, RTS.Nat 4 ] ]
+          (sort facts)
+
+  , TestLabel "recursion must be enabled" $ TestCase $ do
+    withSchemaAndFacts []
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        r <- runQ env repo [s| x.Path _ |]
+        case r of
+          Left (BadQuery err) ->
+            assertBool (unpack err) $
+              "recursive reference to predicate" `isInfixOf` unpack err
+          Right _ -> assertFailure "query succeeded"
+
+  , TestLabel "no continuations" $ TestCase $ do
+    -- A continuation would resume without the facts derived for Path.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        r <- try $ userQuery env repo $ def
+          { userQuery_query = [s| x.Path _ |]
+          , userQuery_options = Just def
+            { userQueryOptions_syntax = QuerySyntax_ANGLE
+            , userQueryOptions_max_results = Just 1
+            }
+          }
+        case r of
+          Left (BadQuery err) ->
+            assertBool (unpack err) $
+              "reached one of its limits" `isInfixOf` unpack err
+          Right _ -> assertFailure "query succeeded"
   ]
 
   where
+    decodeNats response =
+      decodeResults NatTy userQueryResultsBin_facts response
+        >>= either assertFailure return
+
     runQ env repo query =
       try $ userQuery env repo $ def
         { userQuery_query = query

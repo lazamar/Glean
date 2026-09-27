@@ -54,7 +54,6 @@ import Glean.Display
 import qualified Glean.FFI as FFI
 import Glean.Query.Codegen.QueryRegs
 import Glean.Query.Codegen.Types
-import Glean.Database.Types (EnableRecursion(..))
 import Glean.Database.Schema.Types
   ( Bytes(..)
   , PredicateTransformation(..)
@@ -147,6 +146,8 @@ findOutputs stmts = findOutputsStmts stmts IntSet.empty
      foldr (flip (foldr findOutputsStmt)) r stmtss
   findOutputsStmt (CgConditional cond then_ else_) r =
      foldr (flip (foldr findOutputsStmt)) r [cond, then_, else_]
+  -- the queries have their own variables
+  findOutputsStmt CgRec{} r = r
 
   findOutputsGen :: Generator -> IntSet -> IntSet
   findOutputsGen (FactGenerator _ kpat vpat _) r =
@@ -196,8 +197,7 @@ sectionBounds lookup = SectionBoundaries
   <*> Lookup.firstFreeId lookup
 
 compileQuery
-  :: EnableRecursion
-  -> QueryTransformations
+  :: QueryTransformations
   -> Boundaries
   -> CodegenQuery
      -- ^ The query to compile. NB. no type checking or validation is
@@ -205,7 +205,7 @@ compileQuery
      -- malformed query can cause a crash.
   -> IO CompiledQuery
 
-compileQuery r qtrans bounds (QueryWithInfo query numVars lookup ty) = do
+compileQuery qtrans bounds (QueryWithInfo query numVars lookup ty) = do
   StringLog.vlog 2 $ show (displayDefault query)
 
   (idTerm, resultKey, resultValue, stmts) <- if
@@ -241,16 +241,7 @@ compileQuery r qtrans bounds (QueryWithInfo query numVars lookup ty) = do
 
     -- resultKeyReg/resultValueReg is where we build up result values
     outputUninitialized $ \resultKeyOutput resultValueOutput ->
-      let
-        code :: forall a. Code a -> Code a
-        code = compileStatements regs qtrans bounds regs stmts vars
-
-        queryStmts :: forall a. Code a -> Code a
-        queryStmts = case r of
-          EnableRecursion -> recursive regs code code
-          DisableRecursion -> code
-      in
-      queryStmts $ mdo
+      compileStatements regs qtrans bounds regs stmts vars $ mdo
         -- If the result term is a variable, avoid unnecessarily
         -- copying it into resultOutput and just use it directly.
         resultKeyReg <- case resultKey of
@@ -553,6 +544,20 @@ compileStatements
         a <- compile rest
         fail <- label
         return a
+
+      -- Run the queries until a round derives no new facts. Derived facts
+      -- are never removed, so the number of facts only grows, and
+      -- comparing the first free fact id before and after a round tells
+      -- us whether it derived anything.
+      compile (CgRec queries : rest) = do
+        local $ \before after -> do
+          loop <- label
+          firstFreeId before
+          forM_ queries $ compileDerivation syscalls qtrans bounds
+          firstFreeId after
+          sub before after
+          jumpIfNot0 after loop
+        compile rest
 
       -- an empty list of generators should fall through without
       -- executing inner, but we have to compile inner because we need
@@ -1410,60 +1415,43 @@ withTerm vars term action = do
     buildTerm reg vars term
     action reg
 
--- | Execute a piece of code repeatedly for as long as it keeps producing
--- new facts.
---
--- The first argument is executed once first.
--- If it defines new facts then the second argument is executed repeatedly
--- for as long as it keeps adding facts to the Define.
---
-recursive
+-- | Run a query returning the keys and values of facts of a predicate
+-- (see CgRec) to completion, creating a fact for each result.
+compileDerivation
   :: QueryRegs
-  -> (forall a. Code a -> Code a)  -- ^ code for first run
-  -> (forall a. Code a -> Code a)  -- ^ code to evaluate repeatedly
-  -> Code b                        -- ^ code to insert after
-  -> Code b
-recursive QueryRegs{..} before after andThen =
-  local $ \innerRet startId deltaId -> mdo
+  -> QueryTransformations
+  -> Boundaries
+  -> (PidRef, CodegenQuery)
+  -> Code ()
+compileDerivation regs qtrans bounds (pidRef, query) =
+  case qiQuery query of
+    CgQuery (Tuple [key, val]) body -> derive key val body
+    _ -> error "compileDerivation: unexpected query"
+  where
+  derive key val body = do
+    let
+      numVars0 = qiNumVars query
+      -- Create the fact with a statement at the end, which runs for each
+      -- result of the query.
+      fid = Var (Angle.PredicateTy () pidRef) numVars0 Nothing
+      numVars = numVars0 + 1
+      stmts = body ++
+        [ CgStatement (Ref (MatchBind fid))
+            (DerivedFactGenerator pidRef key val) ]
+      outputVars = IntSet.toList $ findOutputs stmts
+    outputUninitialized $ Many (length outputVars) $ \outputRegs ->
+      local $ Many (numVars - length outputVars) $ \localRegs -> do
+      let
+        outputRegAssocs :: [(Int, Register 'BinaryOutputPtr)]
+        outputRegAssocs = zip outputVars outputRegs
 
-  firstFreeId startId
-  siteBefore <- before $ mdo
-    site <- callSite
-    loadLabel ret_ innerRet
-    jump doInner
-    ret_ <- label
-    return site
-  firstFreeId deltaId
+        localRegAssocs :: [(Int, Register 'Word)]
+        localRegAssocs = zip (filter (`notElem` outputVars) [0..]) localRegs
 
-  -- skip to end if there were no new facts produced
-  local $ \difference -> mdo
-    move deltaId difference
-    sub startId difference
-    jumpIf0 difference done
+        vars = Vector.replicate numVars (error "compileDerivation")
+          // (localRegAssocs ++ coerce outputRegAssocs)
 
-  recurse <- label
-  move deltaId startId
-  siteAfter <- after $ mdo
-    site <- callSite
-    loadLabel ret_ innerRet
-    jump doInner
-    ret_ <- label
-    return site
-  firstFreeId deltaId
-
-  -- execute 'after' again if there are new facts
-  local $ \difference -> mdo
-    move deltaId difference
-    sub startId difference
-    jumpIfNot0 difference recurse
-    jump done
-
-  doInner <- label
-  a <- calledFrom [siteBefore, siteAfter] andThen
-  jumpReg innerRet
-
-  done <- label
-  return a
+      compileStatements regs qtrans bounds regs stmts vars (return ())
 
 -- | check that a value matches a pattern, and bind variables as
 -- necessary. The pattern is assumed to cover the *whole* of the

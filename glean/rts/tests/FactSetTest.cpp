@@ -8,6 +8,7 @@
 
 #include "glean/rts/factset.h"
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include "glean/rts/binary.h"
@@ -376,6 +377,73 @@ TEST(FactSetTest, SeekIndexReflectsFactsAddedAfterFirstSeek) {
       fs.seek(Pid::lowest(), folly::ByteRange(prefix, 2), std::nullopt);
   const std::vector<std::string> refreshedExpected{"alpha", "alpine"};
   EXPECT_EQ(collectKeys(*refreshedSeek), refreshedExpected);
+}
+
+// Recursive queries define facts of a predicate while a seek on the same
+// predicate is in progress, and then seek again.
+TEST(FactSetTest, SeekIteratorSurvivesFactsAddedDuringIteration) {
+  FactSet fs(Id::lowest());
+  unsigned char d1[] = "a1";
+  unsigned char d2[] = "a2";
+  unsigned char d3[] = "a3";
+  fs.define(Pid::lowest(), clauseFrom(d1, 2, 2));
+  fs.define(Pid::lowest(), clauseFrom(d3, 2, 2));
+
+  unsigned char prefix[] = "a";
+  auto outer =
+      fs.seek(Pid::lowest(), folly::ByteRange(prefix, 1), std::nullopt);
+  auto first = outer->get();
+  ASSERT_TRUE(first);
+  EXPECT_EQ(first.key().str(), "a1");
+
+  // Define a fact and seek again, which updates the index.
+  fs.define(Pid::lowest(), clauseFrom(d2, 2, 2));
+  auto inner =
+      fs.seek(Pid::lowest(), folly::ByteRange(prefix, 1), std::nullopt);
+  const std::vector<std::string> all{"a1", "a2", "a3"};
+  EXPECT_EQ(collectKeys(*inner), all);
+
+  // The first seek carries on from where it was, and sees the new fact
+  // because it comes later in key order.
+  outer->next();
+  const std::vector<std::string> rest{"a2", "a3"};
+  EXPECT_EQ(collectKeys(*outer), rest);
+}
+
+// A seek indexes the facts added since the previous seek. Recursive queries
+// alternate between adding facts and seeking, with facts of different
+// predicates interleaved, and new keys can come before or after the keys
+// already indexed.
+TEST(FactSetTest, SeekIndexesFactsAddedBetweenSeeks) {
+  FactSet fs(Id::lowest());
+  const auto pid1 = Pid::lowest();
+  const auto pid2 = Pid::lowest() + 1;
+  auto define = [&](Pid pid, const std::string& key) {
+    fs.define(
+        pid,
+        Fact::Clause::from(
+            folly::ByteRange(
+                reinterpret_cast<const unsigned char*>(key.data()), key.size()),
+            key.size()));
+  };
+  std::vector<std::string> expected1, expected2;
+  for (int round = 0; round < 5; ++round) {
+    for (int i = 0; i < 4; ++i) {
+      const auto key = std::to_string(i) + "-" + std::to_string(round);
+      define(pid1, "a" + key);
+      define(pid2, "b" + key);
+      expected1.push_back("a" + key);
+      expected2.push_back("b" + key);
+    }
+    std::sort(expected1.begin(), expected1.end());
+    std::sort(expected2.begin(), expected2.end());
+    EXPECT_EQ(
+        collectKeys(*fs.seek(pid1, folly::ByteRange(), std::nullopt)),
+        expected1);
+    EXPECT_EQ(
+        collectKeys(*fs.seek(pid2, folly::ByteRange(), std::nullopt)),
+        expected2);
+  }
 }
 
 TEST(FactSetTest, FactsByDifferentPredicatesAreIndependent) {

@@ -215,6 +215,48 @@ schemaGenValidation = TestList
 
           schema all.1 : test.1 {}
         |]
+
+  , TestLabel "co-recursive derivation across schemas" $ TestCase $ do
+      -- P gets its derivation from a derive declaration in a later
+      -- schema, so neither schema contains the whole cycle.
+      hasCycles
+        [s|
+          schema test.1 {
+            predicate P : nat
+            predicate Q : nat
+              X where test.P.1 X;
+          }
+
+          schema test.2 : test.1 {
+            derive test.P.1
+              X where test.Q.1 X;
+          }
+
+          schema all.1 : test.2 {}
+        |]
+
+  , TestLabel "default derivations are not cycles" $ TestCase $ do
+      -- The forwards/backwards compatibility pattern from the docs: P.1
+      -- and P.2 derive each other, but only one of the two derivations
+      -- is ever enabled, depending on which facts the DB contains.
+      void $ validate
+        [s|
+          version: 11
+          schema test.1 {
+            predicate P : { a : string, b : nat }
+          }
+          schema test.2 : test.1 {
+            predicate P : { a : string, b : nat, c : {} }
+
+            derive test.P.1 default
+              { A, B } where P.2 { A, B, _ }
+
+            derive test.P.2 default
+              { A, B, {} } where test.P.1 { A, B }
+          }
+
+          schema all.1 : test.1, test.2 {}
+        |]
   ]
   where
     hasCycles schema = do

@@ -1032,7 +1032,7 @@ validateNewSchemaInstance (SchemaIndex curr older) = failOnLeft $ do
   -- Prevent recursive predicates. Because this is a constraint we will remove
   -- in the future, for now we only check this when a new schema instance is to
   -- be generated.
-  mapM_ checkRecursiveDefinitions (schemasResolved $ procSchemaResolved curr)
+  checkRecursiveDefinitions (schemasResolved $ procSchemaResolved curr)
 
   let auto = Map.mapMaybe listToMaybe $ predicatesByRef [curr]
 
@@ -1074,8 +1074,12 @@ validateNewSchemaInstance (SchemaIndex curr older) = failOnLeft $ do
 -- | Detect recursion and co-recursion in predicate derivations.
 -- We don't check default derived predicates because whether they will in fact
 -- recurse or not depends on the db's content.
-checkRecursiveDefinitions :: ResolvedSchemaRef -> Either Text ()
-checkRecursiveDefinitions resolved =
+--
+-- All schemas are checked together because a cycle can span schemas: a
+-- @derive@ declaration can give a derivation to a predicate from another
+-- schema.
+checkRecursiveDefinitions :: [ResolvedSchemaRef] -> Either Text ()
+checkRecursiveDefinitions schemas =
   unless (null recursiveDefinitions) $
   Left $ Text.unlines $
     "found cycles in predicate derivations: " :
@@ -1096,7 +1100,8 @@ checkRecursiveDefinitions resolved =
 
     derivationQueries :: HashMap PredicateRef (Query_ PredicateRef TypeRef)
     derivationQueries = HashMap.mapMaybe
-      (toQuery . derivingDefDeriveInfo ) (resolvedSchemaDeriving resolved)
+      (toQuery . derivingDefDeriveInfo)
+      (HashMap.unions $ map resolvedSchemaDeriving schemas)
       where
         toQuery = \case
           NoDeriving -> Nothing
@@ -1115,10 +1120,13 @@ checkRecursiveDefinitions resolved =
       where
       scc = stronglyConnComp [ (node, node, children node) | node <- roots ]
 
+    types :: HashMap TypeRef ResolvedTypeDef
+    types = HashMap.unions $ map resolvedSchemaTypes schemas
+
     -- predicates referenced by type
     references :: TypeRef -> HashSet PredicateRef
     references tref = fromMaybe mempty $ do
-      TypeDef _ ty _ <- HashMap.lookup tref (resolvedSchemaTypes resolved)
+      TypeDef _ ty _ <- HashMap.lookup tref types
       return $ bifoldMap HashSet.singleton references ty
 
 definitions

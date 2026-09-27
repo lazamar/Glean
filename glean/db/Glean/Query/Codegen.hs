@@ -28,6 +28,7 @@ import Data.Coerce
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.List (find,genericLength)
+import Data.List.Extra (nubOrdOn)
 import Data.Maybe
 import qualified Data.Text as Text
 import qualified Data.Vector as Vector
@@ -147,7 +148,7 @@ findOutputs stmts = findOutputsStmts stmts IntSet.empty
   findOutputsStmt (CgConditional cond then_ else_) r =
      foldr (flip (foldr findOutputsStmt)) r [cond, then_, else_]
   -- the queries have their own variables
-  findOutputsStmt CgRec{} r = r
+  findOutputsStmt (CgRec first _) r = foldr findOutputsStmt r first
 
   findOutputsGen :: Generator -> IntSet -> IntSet
   findOutputsGen (FactGenerator _ kpat vpat _) r =
@@ -545,19 +546,48 @@ compileStatements
         fail <- label
         return a
 
-      -- Run the queries until a round derives no new facts. Derived facts
-      -- are never removed, so the number of facts only grows, and
-      -- comparing the first free fact id before and after a round tells
-      -- us whether it derived anything.
-      compile (CgRec queries : rest) = do
-        local $ \before after -> do
+      -- Run the first statements, then run the queries in rounds until a
+      -- round derives no new facts. Facts are never removed, and new facts
+      -- get increasing ids, so the facts derived since a point are the ones
+      -- with ids from the first free id at that point.
+      -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
+      compile (CgRec first queries : rest) =
+        local $ \roundStart roundEnd rangeStart component -> mdo
+        firstFreeId roundStart
+        compileStatements syscalls qtrans bounds regs first vars $ mdo
+          -- facts derived since roundStart are new in this round
           loop <- label
-          firstFreeId before
-          forM_ queries $ compileDerivation syscalls qtrans bounds
-          firstFreeId after
-          sub before after
-          jumpIfNot0 after loop
-        compile rest
+          firstFreeId roundEnd
+          local $ \new -> do
+            move roundEnd new
+            sub roundStart new
+            jumpIf0 new done
+
+          -- Were there new facts of the predicates being derived? We
+          -- search for them within the new range.
+          loadConst 0 component
+          let newRange = regs { roundRange = Just (roundStart, roundEnd) }
+          forM_ (derivedPredicates queries) $ \(pid, keyTy, valTy) ->
+            compileStatements newRange qtrans bounds newRange
+              [ CgStatement (Ref (MatchWild (Angle.PredicateTy () pid)))
+                  (FactGenerator pid (Ref (MatchWild keyTy))
+                    (Ref (MatchWild valTy)) SeekOnRound)
+              ]
+              Vector.empty
+              (loadConst 1 component)
+
+          -- If there were, consider all demands, otherwise only new ones
+          move roundStart rangeStart
+          jumpIf0 component onlyNew
+          loadConst 0 rangeStart
+          onlyNew <- label
+          let demands = regs { roundRange = Just (rangeStart, roundEnd) }
+          forM_ queries $ compileDerivation demands qtrans bounds
+
+          move roundEnd roundStart
+          jump loop
+          done <- label
+          compile rest
 
       -- an empty list of generators should fall through without
       -- executing inner, but we have to compile inner because we need
@@ -1054,6 +1084,9 @@ compileFactGenerator mtrans bounds qregs@QueryRegs{..}
           seekBetween from to
         (SeekOnStacked, StackedBoundaries _ (SectionBoundaries from to)) ->
           seekBetween from to
+        (SeekOnRound, _) | Just (from, to) <- roundRange ->
+          seekWithinSection typ ptr end from to tok
+        (SeekOnRound, _) -> error "SeekOnRound outside of a saturation"
         _ -> error "unexpected section seek on non-stacked db"
       where
         seekBetween from to = do
@@ -1415,6 +1448,16 @@ withTerm vars term action = do
     buildTerm reg vars term
     action reg
 
+-- | The predicates derived by the queries of a saturation (see CgRec),
+-- and the types of their keys and values.
+derivedPredicates :: [(PidRef, CodegenQuery)] -> [(PidRef, Type, Type)]
+derivedPredicates queries = nubOrdOn (\(PidRef pid _, _, _) -> pid)
+  [ (pid, keyTy, valTy)
+  | (pid, query) <- queries
+  , Angle.RecordTy [Angle.FieldDef _ keyTy, Angle.FieldDef _ valTy] <-
+      [derefType (qiReturnType query)]
+  ]
+
 -- | Run a query returning the keys and values of facts of a predicate
 -- (see CgRec) to completion, creating a fact for each result.
 compileDerivation
@@ -1684,6 +1727,8 @@ generateQueryCode f = generate Optimised $
 
     freeWordSet setToken =
       callFun_1_0 freeWordSet_ setToken
+
+    roundRange = Nothing
 
   in
     f QueryRegs{..}

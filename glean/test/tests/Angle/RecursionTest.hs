@@ -12,6 +12,7 @@ module Angle.RecursionTest (main) where
 import Control.Exception
 import qualified Data.ByteString.Char8 as BC
 import Data.Default (def)
+import Data.Int (Int64)
 import Data.List (isInfixOf, sort)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
@@ -543,6 +544,71 @@ recursionTest = TestList
             Left _ -> 0
         assertBool ("Edge facts searched: " <> show searched) $
           searched > 0 && searched < 30
+
+  , TestLabel "non-linear recursion" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              (x.Path { A, X }; x.Path { X, B }) | x.Edge { A, B }
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        facts <- decodeResultsAs "x.Path.1" schema =<< runQ env repo
+          [s| x.Path _ |]
+        assertEqual "result content"
+          [ RTS.Tuple [ RTS.Nat a, RTS.Nat b ]
+          | a <- [1..4], b <- [a+1..4] ]
+          (sort facts)
+
+  , TestLabel "repeated calls reuse derived facts" $ TestCase $ do
+    -- The second call runs once for each result of the first, always
+    -- with the same demand, which the first call already satisfied. It
+    -- shouldn't search any more edges.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> ... -> 20
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 19 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        edge <- either (assertFailure . unpack) (return . predicatePid) $
+          lookupPredicateSourceRef (parseRef "x.Edge.1") LatestSchema schema
+        let
+          searched :: Either BadQuery UserQueryResults -> Int64
+          searched response = case response of
+            Right UserQueryResults{..} -> fromMaybe 0 $ do
+              stats <- userQueryResults_stats
+              counts <- userQueryStats_facts_searched stats
+              Map.lookup (fromIntegral (RTS.fromPid edge)) counts
+            Left err -> error (show err)
+        once <- runQ env repo [s| x.Path { 1, _ } |]
+        repeated <- runQ env repo
+          [s| { X, Y } where x.Path { 1, X }; x.Path { 1, Y } |]
+        assertEqual "Edge facts searched" (searched once) (searched repeated)
   ]
 
   where

@@ -95,10 +95,39 @@ derives facts that are relevant to the call. The binding patterns come
 from the final order of the statements, so the result is correct
 whatever the order; the order only decides how much gets derived.
 
-Every round of a saturation re-evaluates everything, and results only
-arrive once the saturation is complete. Demands and facts derived for a
-call are kept for the rest of the query, so later calls that need the
-same facts find them already derived.
+Every round of a saturation looks at all the facts derived so far, and
+results only arrive once the saturation is complete. Demands and facts
+derived for a call are kept for the rest of the query, so later calls
+that need the same facts find them already derived.
+-}
+
+{- Note [Semi-naive evaluation]
+
+Re-running the queries of a saturation for every demand in every round
+repeats work: a round can only derive something new for a demand if the
+demand is new, or if the previous round derived new facts of the
+predicates being derived. So a round only looks at (section 5 of the
+design):
+
+  Demand[new] | (P[new] _; Demand[old])
+
+that is, the new demands, and also the old ones if there are new facts
+of the predicates being derived. Facts are never removed and new facts
+get increasing ids, so "new" means "with an id from the first free id at
+the start of the previous round", and the demands to look at are a range
+of ids: from the start of the previous round, or from the beginning if
+there were new facts of the predicates being derived. CgRec
+computes the range at the start of each round, and the derivation
+queries search for demands with SeekOnRound, which searches within it.
+
+The first round starts before the statements that create the demand of
+the call (the first argument of the design's two-argument rec), so it
+only looks at that demand. If the demand already existed, nothing is new
+and the saturation stops straight away: the facts it needs were derived
+by an earlier call.
+
+A search can miss facts that are derived while it is in progress (see
+FactSet::seek). That's fine: a missed fact is new in the next round.
 -}
 
 -- | Derive the facts of the recursive predicates that a query searches
@@ -217,7 +246,7 @@ call inside ref key = do
           return [create]
         else do
           derivations <- lift $ componentDerivations this
-          return [create, CgRec derivations]
+          return [CgRec [create] derivations]
 
 freshVar :: Type -> V Var
 freshVar ty = do

@@ -104,7 +104,7 @@ instance VarsOf CgStatement where
   varsOf w (CgConditional cond then_ else_) r =
     varsOf w cond $! varsOf w then_ $! varsOf w else_ r
   -- the queries have their own variables
-  varsOf _ CgRec{} r = r
+  varsOf w (CgRec first _) r = varsOf w first r
 
 -- -----------------------------------------------------------------------------
 -- Fresh variables
@@ -210,7 +210,8 @@ reWildStatement used (CgConditional cond then_ else_) =
     (map (reWildStatement used) then_)
     (map (reWildStatement used) else_)
 -- the queries have their own variables
-reWildStatement _ s@CgRec{} = s
+reWildStatement used (CgRec first queries) =
+  CgRec (map (reWildStatement used) first) queries
 
 reWildQuery :: VarMap -> CgQuery -> CgQuery
 reWildQuery used (CgQuery head stmts) =

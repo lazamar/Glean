@@ -134,6 +134,11 @@ data QueryRegs = QueryRegs
     -- | Unused, temporarily kept for backwards compatibility
   , saveState :: Register 'Word
 
+    -- | The range of fact ids that 'SeekOnRound' searches, when
+    -- compiling the queries of a saturation.
+    -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
+  , roundRange :: Maybe (Register 'Word, Register 'Word)
+
     -- | Maximum number of results to return
   , maxResults :: Register 'Word
 

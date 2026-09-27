@@ -826,6 +826,7 @@ runQuery
       case cont of
         Right ucont -> do
           let binaryCont = Thrift.userQueryCont_continuation ucont
+          when (B.null binaryCont) $ throwIO $ Thrift.BadQuery noContinuation
           results <- transformResultsBack appliedTrans <$>
             restartCompiled
               schemaInventory
@@ -845,7 +846,7 @@ runQuery
               | Thrift.queryDebugOptions_bytecode debug ]
 
           bracket
-            (timeIt $ compileQuery (envEnableRecursion env) trans bounds query)
+            (timeIt $ compileQuery trans bounds query)
             (\(_, _, sub) -> release $ compiledQuerySub sub)
             $ \(codegenTime, _, sub) -> do
               results <- transformResultsBack appliedTrans <$>
@@ -869,11 +870,19 @@ runQuery
           queryResultsFacts
         else return Nothing
 
+    -- A query that evaluates recursive predicates can't be continued,
+    -- because the continuation would resume without the facts derived so
+    -- far. So when it reaches a limit we return the results we have
+    -- along with an empty continuation, which tells clients that the
+    -- results are incomplete. Resuming it is an error.
+    let incomplete = isJust queryResultsCont
+          && either usesRecursion (const False) cont
     userCont <- case queryResultsCont of
       Nothing -> return Nothing
       Just bs -> do
         nextId <- firstFreeId derived
-        return $ Just $ mkUserQueryCont (Right returnType) bs nextId
+        let bs' = if incomplete then B.empty else bs
+        return $ Just $ mkUserQueryCont (Right returnType) bs' nextId
 
     stats <- getStats schema fullScans qResults
 
@@ -889,7 +898,8 @@ runQuery
           , resNestedFacts = mkNestedFacts queryResultsNestedFacts
           , resCont = userCont
           , resStats = stats
-          , resDiags = compileDiag ++ queryDiag
+          , resDiags = compileDiag ++ queryDiag ++
+              [ noContinuation | incomplete ]
           , resWriteHandle = maybeWriteHandle
           , resFactsSearched = queryResultsStats
           , resType = Just ppType
@@ -981,7 +991,7 @@ compileAngleQuery rec ver dbSchema mode source stored debug = do
       (dbSchemaRtsType dbSchema) resolved
   ifDebug $ "typechecked query: " <> show (displayDefault (qiQuery typechecked))
 
-  flattened <- checkBadQuery id $ runExcept $
+  (flattened, derivations) <- checkBadQuery id $ runExcept $
     flatten rec dbSchema latestAngleVersion stored typechecked
   ifDebug $ "flattened query: " <> show (displayDefault (qiQuery flattened))
 
@@ -991,13 +1001,33 @@ compileAngleQuery rec ver dbSchema mode source stored debug = do
   reordered <- checkBadQuery id $ runExcept $ reorder dbSchema optimised
   ifDebug $ "reordered query: " <> show (displayDefault (qiQuery reordered))
 
+  -- The queries deriving the facts of recursive predicates are
+  -- independent of the main query and of each other.
+  -- See Note [Evaluating recursive predicates] in Glean.Query.Flatten.
+  recs <- forM derivations $ \component -> do
+    queries <- forM component $ \(pid, derivation) -> do
+      optimisedDerivation <- checkBadQuery id $ runExcept $
+        optimise derivation
+      reorderedDerivation <- checkBadQuery id $ runExcept $
+        reorder dbSchema optimisedDerivation
+      return (pid, reorderedDerivation)
+    return (CgRec queries)
+
   final <- case mode of
     NoExtraSteps -> return reordered
     IncrementalDerivation getStats -> do
       vlog 2 "made incremental"
       return $ makeIncremental getStats reordered
 
-  return (final, qiReturnType typechecked, preds)
+  let
+    withRecursion = case qiQuery final of
+      CgQuery hd stmts -> final { qiQuery = CgQuery hd (recs <> stmts) }
+
+  unless (null recs) $
+    ifDebug $ "with recursive predicates: " <>
+      show (displayDefault (qiQuery withRecursion))
+
+  return (withRecursion, qiReturnType typechecked, preds)
   where
   ifDebug = when (queryDebug debug) . hPutStrLn stderr
 
@@ -1005,6 +1035,24 @@ compileAngleQuery rec ver dbSchema mode source stored debug = do
   checkBadQuery txt act = case act of
     Left str -> throwIO $ Thrift.BadQuery $ txt str
     Right a -> return a
+
+-- | Why the results of a query that evaluates recursive predicates are
+-- incomplete, when it reaches a limit
+noContinuation :: Text
+noContinuation =
+  "the query uses recursive predicates and reached one of its limits " <>
+  "(results, bytes or time), and such queries can't be continued. " <>
+  "These are the results found so far; to get more, increase the limit."
+
+-- | Whether a query evaluates recursive predicates
+-- (see Note [Evaluating recursive predicates] in Glean.Query.Flatten).
+usesRecursion :: CodegenQuery -> Bool
+usesRecursion QueryWithInfo{..} = any isRec stmts
+  where
+  CgQuery _ stmts = qiQuery
+  isRec = \case
+    CgRec{} -> True
+    _ -> False
 
 -- | Put the nested facts in the right form for the conversion to
 -- (JSON, Compact, Bin).

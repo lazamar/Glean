@@ -35,6 +35,8 @@ module Glean.Query.Flatten.Types
 
 import Control.Monad.Except
 import Control.Monad.State
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
 import qualified Data.IntSet as IntSet
 import Data.Text (Text)
 import Compat.Prettyprinter hiding ((<>))
@@ -276,12 +278,15 @@ instance Display FlatStatement where
 data FlattenState = FlattenState
   { flDbSchema :: DbSchema
   , flNextVar :: Int
-  , flDeriveStored :: Maybe PredicateId
-    -- ^ we should derive this DerivedAndStored predicate
-  , flStack :: [PredicateId]
-    -- ^ Stack of derived predicates, to prevent recursion. (for now,
-    -- until we have support for recursion).
+  , flDerive :: Maybe PredicateId
+    -- ^ Expand the derivation of this predicate even though it is
+    -- stored or recursive, because we are deriving its facts. Only the
+    -- first reference is expanded, so recursive references search for
+    -- the facts derived so far.
   , flRecursion :: EnableRecursion
+  , flRecursiveComponents :: IntMap RecursiveComponent
+    -- ^ Components of recursive predicates that the query refers to,
+    -- by index. Their facts must be derived before the query runs.
   }
 
 getPredicateDetails :: PredicateId -> F PredicateDetails
@@ -297,12 +302,12 @@ initialFlattenState
   -> Int
   -> Maybe PredicateId
   -> FlattenState
-initialFlattenState rec dbSchema nextVar deriveStored = FlattenState
+initialFlattenState rec dbSchema nextVar derive = FlattenState
   { flDbSchema = dbSchema
   , flNextVar = nextVar
-  , flDeriveStored = deriveStored
-  , flStack = []
+  , flDerive = derive
   , flRecursion = rec
+  , flRecursiveComponents = IntMap.empty
   }
 
 type F a = StateT FlattenState (Except Text) a

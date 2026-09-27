@@ -51,6 +51,7 @@ data QueryWithInfo q = QueryWithInfo
   , qiGenerator :: Maybe Generator -- see Note [query result] in Flatten.hs
   , qiReturnType :: Type
   }
+  deriving Show
 
 -- -----------------------------------------------------------------------------
 -- Flattened Query types
@@ -87,6 +88,14 @@ data CgStatement_ var
     , then_ :: [CgStatement_ var]
     , else_ :: [CgStatement_ var]
     }
+  | CgRec [(PidRef, CodegenQuery)]
+    -- ^ Derive all the facts of a component of recursive predicates.
+    -- There is a query for each predicate, returning the key and value
+    -- of its facts. We run the queries and create facts from their
+    -- results until they stop producing new facts. Each query has its
+    -- own variables, and none of them are visible to the statements
+    -- that follow.
+    -- See Note [Evaluating recursive predicates] in Glean.Query.Flatten.
   deriving (Show, Functor, Foldable, Traversable)
 
 
@@ -339,6 +348,13 @@ instance Display CgStatement where
       [ nest 2 $ sep ["if", doStmts cond ]
       , nest 2 $ sep ["then", doStmts then_]
       , nest 2 $ sep ["else", doStmts else_]
+      ]
+    CgRec queries -> hang 2 $ sep
+      [ "rec ("
+      , sep $ punctuate ";"
+          [ hang 2 $ sep [display opts pid <+> "<-", display opts (qiQuery q)]
+          | (pid, q) <- queries ]
+      , ")"
       ]
     where
       doStmts stmts = hang 2 $

@@ -415,6 +415,35 @@ recursionTest = TestList
           [ RTS.Tuple [ RTS.Nat 3, RTS.Nat 4 ] ]
           (sort facts)
 
+  , TestLabel "negated call followed by the same call" $ TestCase $ do
+    -- The negation stops as soon as it finds a path. If that could leave
+    -- the derivation for its demand unfinished, the second call, which
+    -- has the same demand, would find the demand already there, take it
+    -- as satisfied, and miss results. See Note [Semi-naive evaluation].
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> ... -> 10
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 9 :: Int]
+          ]
+      ]
+      $ \env repo _ -> do
+        nodes <- decodeNats =<< runQ env repo
+          [s| X where (!(x.Path { 1, _ }); X = 0) | x.Path { 1, X } |]
+        assertEqual "nodes reachable from 1"
+          (map RTS.Nat [2 .. 10]) (sort nodes)
+
   , TestLabel "recursion must be enabled" $ TestCase $ do
     withSchemaAndFacts []
       [s|

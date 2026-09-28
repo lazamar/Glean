@@ -27,8 +27,7 @@ import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 
-import Glean.Angle.Hash (hash0)
-import Glean.Angle.Types (PredicateId(..), DerivingInfo(..))
+import Glean.Angle.Types (PredicateId(..), DerivingInfo(..), queryPredicateId)
 import qualified Glean.Angle.Types as Angle
 import Glean.Database.Schema.Types
 import Glean.Display
@@ -39,7 +38,6 @@ import Glean.Query.Vars (varsBound, varsUsed)
 import Glean.RTS.Term (Term(..))
 import Glean.RTS.Types (Pid(..), PidRef(..), Type, FieldDef, derefType)
 import Glean.Schema.Util (showRef)
-import Glean.Types (PredicateRef(..))
 
 {- Note [Evaluating recursive predicates]
 
@@ -570,7 +568,7 @@ newPredicate :: Text -> Type -> E PidRef
 newPredicate name keyTy = do
   pid <- gets exNextPid
   let
-    ref = PredicateId (PredicateRef name 0) hash0
+    ref = queryPredicateId name
     details = PredicateDetails
       { predicatePid = pid
       , predicateId = ref

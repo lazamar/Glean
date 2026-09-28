@@ -147,8 +147,8 @@ findOutputs stmts = findOutputsStmts stmts IntSet.empty
   findOutputsStmt (CgConditional cond then_ else_) r =
      foldr (flip (foldr findOutputsStmt)) r [cond, then_, else_]
   -- the queries have their own variables
-  findOutputsStmt (CgRec first _ _ yield) r =
-    foldr findOutputsStmt r (first <> yield)
+  findOutputsStmt (CgRec first _ _ yield complete) r =
+    foldr findOutputsStmt r (first <> yield <> concat complete)
 
   findOutputsGen :: Generator -> IntSet -> IntSet
   findOutputsGen (FactGenerator _ kpat vpat _) r =
@@ -556,7 +556,7 @@ compileStatements
       -- its first free id at the start of the round to its first free id
       -- at the end.
       -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
-      compile (CgRec first queries auxiliary yield : rest) =
+      compile (CgRec first queries auxiliary yield complete : rest) =
         local $ \store roundStart roundEnd -> do
         newStore store
         let
@@ -583,7 +583,12 @@ compileStatements
           move roundEnd roundStart
           jump loop
           done <- label
-          -- free the store
+          -- The evaluation is complete, and so are all of its demands (see
+          -- Note [Caching] in Glean.Query.Recursion). Mark them, and free
+          -- the store.
+          forM_ complete $ \stmts ->
+            compileStatements syscalls qtrans bounds recRegs stmts vars $
+              return ()
           endSeek store
           return a
 

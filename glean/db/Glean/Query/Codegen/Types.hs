@@ -94,6 +94,7 @@ data CgStatement_ var
       [CgDerivation]
       [PidRef]
       [CgStatement_ var]
+      [[CgStatement_ var]]
     -- ^ Evaluate a call to a recursive predicate. The first statements
     -- run first and create the call's demand. Then we run the queries in
     -- rounds, creating facts from their results, until a round creates no
@@ -103,8 +104,10 @@ data CgStatement_ var
     -- and none of them are visible to the statements that follow. The
     -- facts of the given predicates, the auxiliary predicates of the
     -- evaluation (demands, suspensions and supplies), are kept in a store
-    -- of its own. See Note [Streaming] and Note [Isolation] in
-    -- Glean.Query.Recursion.
+    -- of its own. When the rounds are over, each of the last lists of
+    -- statements runs to completion, marking the evaluation's demands as
+    -- completed. See Note [Streaming], Note [Isolation] and
+    -- Note [Caching] in Glean.Query.Recursion.
     -- See Note [Evaluating recursive predicates] and
     -- Note [Semi-naive evaluation] in Glean.Query.Recursion.
   deriving (Show, Functor, Foldable, Traversable)
@@ -371,7 +374,7 @@ instance Display CgStatement where
       , nest 2 $ sep ["then", doStmts then_]
       , nest 2 $ sep ["else", doStmts else_]
       ]
-    CgRec first queries _ yield -> hang 2 $ sep
+    CgRec first queries _ yield complete -> hang 2 $ sep
       [ "rec" <+> doStmts first
       , "("
       , sep $ punctuate ";"
@@ -379,6 +382,7 @@ instance Display CgStatement where
           | CgDerivation pid _ q <- queries ]
       , ")"
       , "yield" <+> doStmts yield
+      , "complete" <+> sep (map doStmts complete)
       ]
     where
       doStmts stmts = hang 2 $

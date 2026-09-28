@@ -15,7 +15,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Default (def)
 import Data.Int (Int64)
-import Data.List (isInfixOf, sort)
+import Data.List (isInfixOf, nub, sort)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
@@ -641,13 +641,14 @@ recursionTest = TestList
           | a <- [1..4], b <- [a+1..4] ]
           (sort facts)
 
-  , TestLabel "each call derives its own facts" $ TestCase $ do
+  , TestLabel "repeated calls reuse derived facts" $ TestCase $ do
     -- The second call runs once for each of the 19 results of the first,
-    -- always with the same demand as the first. Each of those evaluations
-    -- is isolated (Note [Isolation] in Glean.Query.Recursion), so each one
-    -- searches the edges again.
-    -- TODO: caching completed demands (section 14 of the design) should
-    -- bring this down to the edges searched by a single call.
+    -- always with the same demand as the first. The first result arrives
+    -- before the first evaluation has finished, so the second call
+    -- evaluates the demand once, and completes it; after that, every call
+    -- finds it completed and just searches (Note [Caching] in
+    -- Glean.Query.Recursion). So the edges are searched twice, instead of
+    -- once for each call.
     withSchemaAndFacts [enableRecursion]
       [s|
         schema x.1 {
@@ -681,7 +682,41 @@ recursionTest = TestList
         repeated <- runQ env repo
           [s| { X, Y } where x.Path { 1, X }; x.Path { 1, Y } |]
         assertEqual "Edge facts searched"
-          (20 * searched once) (searched repeated)
+          (2 * searched once) (searched repeated)
+
+  , TestLabel "evaluations reuse completed subgoals" $ TestCase $ do
+    -- Path is right-recursive, so evaluating x.Path { 5, _ } completes the
+    -- demands for 5, 6, ..., 20. Evaluating x.Path { 1, _ } afterwards
+    -- finds x.Path { 5, _ } completed, and only searches the edges from 1
+    -- to 4 (Note [Caching] in Glean.Query.Recursion). Together they search
+    -- as many edges as evaluating x.Path { 1, _ } alone.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Edge { A, K }; x.Path { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> ... -> 20
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 19 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        one <- runQ env repo [s| x.Path { 1, _ } |]
+        both <- runQ env repo [s| X where N = (5 | 1); x.Path { N, X } |]
+        nodes <- decodeNats both
+        assertEqual "nodes reachable from 1 or 5"
+          (map RTS.Nat [2 .. 20]) (nub (sort nodes))
+        searchedOne <- factsSearched schema "x.Edge.1" one
+        searchedBoth <- factsSearched schema "x.Edge.1" both
+        assertEqual "Edge facts searched" searchedOne searchedBoth
 
   , TestLabel "resumes a derivation once for each fact" $ TestCase $ do
     -- All the facts of x.Path { 1, _ } are derived for the same demand.

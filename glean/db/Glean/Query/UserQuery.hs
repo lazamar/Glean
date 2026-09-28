@@ -18,6 +18,7 @@ import Control.DeepSeq
 import Control.Exception
 import Control.Monad
 import Control.Monad.Except
+import Data.Bifoldable (bifoldMap)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
@@ -61,6 +62,7 @@ import qualified Glean.Backend.Types as Backend
 import Glean.Schema.Types
   (RefTarget(..), LookupResult(..), NameEnv, resolveRef)
 import qualified Glean.Database.Catalog as Catalog
+import Glean.Database.Schema (addLocalPredicates)
 import Glean.Database.Schema.Types
 import Glean.Database.Open
 import qualified Glean.Database.PredicateStats as PredicateStats
@@ -650,18 +652,18 @@ userQueryImpl
     schemaVersion <-
       schemaVersionForQuery schema config userQuery_schema_id
 
-    (returnType,compileTime,diag,cont) <-
+    (returnType,compileTime,diag,cont,querySchema) <-
       case Thrift.userQueryOptions_continuation opts of
         Just ucont
           | Just retTy <- Thrift.userQueryCont_returnType ucont -> do
           (compileTime, _, returnType) <-
             timeIt $ compileType schema schemaVersion retTy
-          return (returnType,compileTime,[],Right ucont)
+          return (returnType,compileTime,[],Right ucont,schema)
 
         -- This is either a new query or the continuation of a query
         -- that returns a temporary predicate.
         _ -> do
-          (compileTime, _, (query@QueryWithInfo{..}, ty, preds)) <-
+          (compileTime, _, compiled) <-
             timeIt $ compileAngleQuery
               schemaVersion
               schema
@@ -669,9 +671,10 @@ userQueryImpl
               userQuery_query
               stored
               (envDebug env)
+          let (query@QueryWithInfo{..}, ty, preds, querySchema) = compiled
 
           predDiag <- if Thrift.queryDebugOptions_pred_has_facts debug then
-              getPredDiags env repo schema preds
+              getPredDiags env repo querySchema preds
               else return []
           let
             irDiag =
@@ -681,7 +684,7 @@ userQueryImpl
             cont = case Thrift.userQueryOptions_continuation opts of
               Just c -> Right c
               Nothing -> Left query
-          return (ty,compileTime,irDiag <> predDiag,cont)
+          return (ty,compileTime,irDiag <> predDiag,cont,querySchema)
 
     details <- getReturnPredicateDetails schema returnType
 
@@ -692,7 +695,8 @@ userQueryImpl
         returnType = returnType,
         compileTime = compileTime,
         compileDiag = diag,
-        cont = cont
+        cont = cont,
+        querySchema = querySchema
         }
       runQuery env odb config bounds lookup repo details compileInfo query
 
@@ -700,7 +704,9 @@ data CompileInfo = CompileInfo {
   returnType :: Type,
   compileTime :: Double,
   compileDiag :: [Text],
-  cont :: Either CodegenQuery UserQueryCont
+  cont :: Either CodegenQuery UserQueryCont,
+  querySchema :: DbSchema
+    -- ^ the DB's schema and the predicates the query declares
 }
 
 getPredDiags
@@ -785,7 +791,7 @@ runQuery
     vlog 2 $ "return type: " <> show (displayDefault returnType)
 
     let
-      schema@DbSchema{..} = odbSchema odb
+      schema = odbSchema odb
       opts = fromMaybe def userQuery_options
       stored = Thrift.userQueryOptions_store_derived_facts opts
 
@@ -833,7 +839,7 @@ runQuery
           when (B.null binaryCont) $ throwIO $ Thrift.BadQuery noContinuation
           results <- transformResultsBack appliedTrans <$>
             restartCompiled
-              schemaInventory
+              (schemaInventory schema)
               defineOwners
               stack
               (Just $ predicatePid details)
@@ -854,7 +860,8 @@ runQuery
             (\(_, _, sub) -> release $ compiledQuerySub sub)
             $ \(codegenTime, _, sub) -> do
               results <- transformResultsBack appliedTrans <$>
-                executeCompiled schemaInventory defineOwners stack sub limits
+                executeCompiled (schemaInventory schema) defineOwners stack
+                  sub limits
 
               diags <-
                 evaluate $ force (bytecodeDiag sub) -- don't keep sub alive
@@ -878,9 +885,12 @@ runQuery
     -- because the continuation would resume without the facts derived so
     -- far. So when it reaches a limit we return the results we have
     -- along with an empty continuation, which tells clients that the
-    -- results are incomplete. Resuming it is an error.
-    let incomplete = isJust queryResultsCont
-          && either usesRecursion (const False) cont
+    -- results are incomplete. Resuming it is an error. The same goes for
+    -- queries that declare predicates (see Note [Query-local predicates]).
+    let incomplete = isJust queryResultsCont && case cont of
+          Left query -> usesRecursion query || declaresPredicates
+          Right _ -> False
+        declaresPredicates = not (Set.null (schemaLocalPids querySchema))
     userCont <- case queryResultsCont of
       Nothing -> return Nothing
       Just bs -> do
@@ -981,22 +991,38 @@ compileAngleQuery
   -> ByteString
   -> Bool
   -> DebugFlags
-  -> IO (CodegenQuery, Type, [TcPred])
-compileAngleQuery ver dbSchema mode source stored debug = do
-  parsed <- checkBadQuery Text.pack $ Angle.parseQuery source
+  -> IO (CodegenQuery, Type, [TcPred], DbSchema)
+     -- ^ the query, its type, the predicates it uses, and the schema it
+     -- was compiled with (the DB's schema plus the declared predicates)
+compileAngleQuery ver schema mode source stored debug = do
+  (parsed, decls) <- checkBadQuery Text.pack $
+    Angle.parseQueryWithPredicates source
   ifDebug $ "parsed query: " <> show (displayDefault parsed)
 
-  let scope = addTmpPredicate $ fromMaybe HashMap.empty $
-        schemaNameEnv dbSchema ver
+  -- the facts of declared predicates only exist while the query runs
+  when (stored && not (null decls)) $ throwIO $ Thrift.BadQuery
+    "a query that declares predicates can't store derived facts"
 
-  resolved <- checkBadQuery id $ runExcept $
-    runResolve latestAngleVersion scope $ resolveQuery parsed
+  let scope = addTmpPredicate $ fromMaybe HashMap.empty $
+        schemaNameEnv schema ver
+
+  (resolved, defs) <- checkBadQuery id $ runExcept $
+    runResolve latestAngleVersion scope $
+      resolveQueryWithPredicates parsed decls
   ifDebug $ "resolved query: " <> show (displayDefault resolved)
 
+  -- See Note [Query-local predicates]
+  let tcOpts = defaultTcOpts debug latestAngleVersion
+  dbSchema <- (checkBadQuery id =<<) $ runExceptT $
+    addLocalPredicates tcOpts defs schema
+
   (typechecked, preds) <- (checkBadQuery id =<<) $ runExceptT $
-    typecheck dbSchema (defaultTcOpts debug latestAngleVersion)
-      (dbSchemaRtsType dbSchema) resolved
+    typecheck dbSchema tcOpts (dbSchemaRtsType dbSchema) resolved
   ifDebug $ "typechecked query: " <> show (displayDefault (qiQuery typechecked))
+
+  let returned = localPidsIn dbSchema (qiReturnType typechecked)
+  unless (Set.null returned) $ throwIO $ Thrift.BadQuery $
+    "a query can't return facts of the predicates it declares yet"
 
   flattened <- checkBadQuery id $ runExcept $
     flatten dbSchema latestAngleVersion stored typechecked
@@ -1023,7 +1049,7 @@ compileAngleQuery ver dbSchema mode source stored debug = do
     ifDebug $ "with recursive predicates: " <>
       show (displayDefault (qiQuery withRecursion))
 
-  return (withRecursion, qiReturnType typechecked, preds)
+  return (withRecursion, qiReturnType typechecked, preds, dbSchema)
   where
   ifDebug = when (queryDebug debug) . hPutStrLn stderr
 
@@ -1032,13 +1058,63 @@ compileAngleQuery ver dbSchema mode source stored debug = do
     Left str -> throwIO $ Thrift.BadQuery $ txt str
     Right a -> return a
 
--- | Why the results of a query that evaluates recursive predicates are
--- incomplete, when it reaches a limit
+{- Note [Query-local predicates]
+
+A query can declare predicates after its body, written the same way as
+a schema's derived predicates:
+
+  X where Reach { 1, X }
+  predicate Reach : { from: nat, to: nat }
+    { A, B } where x.Edge { A, B } | (Reach { A, K }; x.Edge { K, B })
+
+They're derived when they're used, like a schema's derived predicates,
+and can be recursive (see Note [Evaluating recursive predicates] in
+Glean.Query.Recursion). That's the whole point. They let a query compute
+a relation that the schema has no predicate for, like the transitive
+closure of a relation, in a single query.
+
+* Names. A declared predicate has a plain name, with no schema or
+  version. It's in scope in the query and in the derivations of all the
+  declared predicates, so they can call themselves and each other. It
+  can't shadow anything, because everything else a query can refer to
+  has a qualified name (x.Edge).
+
+* Declarations. Only predicates derived on demand can be declared, with
+  a key type and optionally a value type. Stored predicates and default
+  derivations make no sense for predicates that only exist while the
+  query runs.
+
+* Schema. We compile the query with the DB's schema plus the declared
+  predicates (addLocalPredicates), which get the Pids after the schema's.
+  They're checked in the same way as a schema's predicates. Their
+  derivations are typechecked, and they can't depend on their own
+  negation (see Note [Stratification] in Glean.Database.Schema). After
+  that they're like any other derived predicate, so flattening,
+  recursion and code generation need nothing new. Queries that don't
+  declare predicates use the DB's schema as before.
+
+* Continuations. A query that declares predicates can't be continued,
+  just like a query that evaluates recursive predicates. When it reaches
+  a limit it returns the results it has. Resuming it would need the
+  declarations, which aren't part of the continuation, and the facts
+  derived so far, which don't outlive the query.
+-}
+
+-- | The predicates declared by a query that a type refers to directly.
+-- See Note [Query-local predicates].
+localPidsIn :: DbSchema -> Type -> Set Pid
+localPidsIn dbSchema ty = Set.intersection (schemaLocalPids dbSchema) pids
+  where
+  pids = bifoldMap (\(PidRef pid _) -> Set.singleton pid) (const mempty) ty
+
+-- | Why the results of a query that can't be continued are incomplete,
+-- when it reaches a limit
 noContinuation :: Text
 noContinuation =
-  "the query uses recursive predicates and reached one of its limits " <>
-  "(results, bytes or time), and such queries can't be continued. " <>
-  "These are the results found so far; to get more, increase the limit."
+  "the query reached one of its limits (results, bytes or time), and " <>
+  "queries that use recursive predicates or declare predicates can't be " <>
+  "continued. These are the results found so far; to get more, increase " <>
+  "the limit."
 
 -- | Whether a query evaluates recursive predicates
 -- (see Note [Evaluating recursive predicates] in Glean.Query.Recursion).

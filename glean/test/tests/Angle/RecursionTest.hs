@@ -948,6 +948,205 @@ recursionTest = TestList
           (sort facts)
   ]
 
+-- | Predicates declared by a query. See Note [Query-local predicates] in
+-- Glean.Query.UserQuery.
+localTest :: Test
+localTest = TestList
+  [ TestLabel "recursive" $ TestCase $ withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Reach { 1, X }
+        predicate Reach : { from: nat, to: nat }
+          { A, B } where x.Edge { A, B } | (Reach { A, K }; x.Edge { K, B })
+      |]
+    assertEqual "nodes reachable from 1" (map RTS.Nat [2, 3, 4]) (sort nodes)
+
+  , TestLabel "not recursive" $ TestCase $ withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where TwoSteps { 1, X }
+        predicate TwoSteps : { from: nat, to: nat }
+          { A, C } where x.Edge { A, B }; x.Edge { B, C }
+      |]
+    assertEqual "two steps from 1" [RTS.Nat 3] nodes
+
+  , TestLabel "calling each other" $ TestCase $ withGraph $ \env repo _ -> do
+    -- Even refers to Odd, which is declared after it
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Odd { 1, X }
+        predicate Even : { from: nat, to: nat }
+          { A, B } where Odd { A, K }; x.Edge { K, B }
+        predicate Odd : { from: nat, to: nat }
+          { A, B } where x.Edge { A, B } | (Even { A, K }; x.Edge { K, B })
+      |]
+    assertEqual "an odd number of steps from 1"
+      (map RTS.Nat [2, 4]) (sort nodes)
+
+  , TestLabel "calling a recursive schema predicate" $ TestCase $
+    withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Far { 1, X }
+        predicate Far : { from: nat, to: nat }
+          { A, B } where x.Path { A, B }; !x.Edge { A, B }
+      |]
+    assertEqual "more than one step from 1" (map RTS.Nat [3, 4]) (sort nodes)
+
+  , TestLabel "with a value" $ TestCase $ withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        V where Next 3 -> V
+        predicate Next : nat -> nat
+          A -> B where x.Edge { A, B }
+      |]
+    assertEqual "after 3" [RTS.Nat 4] nodes
+
+  , TestLabel "names don't shadow the schema's" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- the schema's predicates have qualified names
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Edge X
+        predicate Edge : nat
+          X where x.Edge { 1, X }
+      |]
+    assertEqual "after 1" [RTS.Nat 2] nodes
+
+  , TestLabel "declared once" $ TestCase $ withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          X where X = 1
+        predicate P : nat
+          X where X = 2
+      |]
+    assertBadQuery "predicate declared more than once: P" r
+
+  , TestLabel "derived on demand only" $ TestCase $
+    withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          stored X where X = 1
+      |]
+    assertBadQuery "can't be stored" r
+
+  , TestLabel "typechecked" $ TestCase $ withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          X where X = "a"
+      |]
+    assertBadQuery "In P" r
+
+  , TestLabel "no recursion through negation" $ TestCase $
+    withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          N where x.Edge { N, _ }; !Q N
+        predicate Q : nat
+          N where P N
+      |]
+    assertBadQuery "recursion through negation" r
+
+  , TestLabel "can't return their facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    forM_
+      [ [s| Reach { 1, _ } |]
+      , [s| { R, X } where R = Reach { 1, X } |]
+      ] $ \query -> do
+      r <- runQ env repo $ query <> [s|
+        predicate Reach : { from: nat, to: nat }
+          { A, B } where x.Edge { A, B } | (Reach { A, K }; x.Edge { K, B })
+      |]
+      assertBadQuery "can't return facts of the predicates it declares" r
+
+  , TestLabel "results up to a limit, without continuing" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- TwoSteps isn't recursive, but the query still can't be continued
+    -- because its continuation wouldn't have the declaration.
+    let
+      options = def
+        { userQueryOptions_syntax = QuerySyntax_ANGLE
+        , userQueryOptions_max_results = Just 1
+        }
+      query = def
+        { userQuery_query =
+            [s|
+              X where TwoSteps { _, X }
+              predicate TwoSteps : { from: nat, to: nat }
+                { A, C } where x.Edge { A, B }; x.Edge { B, C }
+            |]
+        , userQuery_options = Just options
+        , userQuery_encodings = [ UserQueryEncoding_bin def ]
+        }
+      noContinuation = "can't be continued"
+    UserQueryResults{..} <- userQuery env repo query
+    case userQueryResults_results of
+      UserQueryEncodedResults_bin bin ->
+        assertEqual "results" 1 (Map.size (userQueryResultsBin_facts bin))
+      _ -> assertFailure "unexpected encoding"
+    assertBool "diagnostic" $
+      any ((noContinuation `isInfixOf`) . unpack) userQueryResults_diagnostics
+    cont <- maybe (assertFailure "no continuation") return
+      userQueryResults_continuation
+    r <- try $ userQuery env repo query
+      { userQuery_options = Just options
+          { userQueryOptions_continuation = Just cont } }
+    assertBadQuery noContinuation r
+
+  , TestLabel "can't store derived facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    r <- try $ userQuery env repo $ def
+      { userQuery_query =
+          [s|
+            X where P X
+            predicate P : nat
+              X where X = 1
+          |]
+      , userQuery_options = Just def
+          { userQueryOptions_syntax = QuerySyntax_ANGLE
+          , userQueryOptions_store_derived_facts = True
+          }
+      , userQuery_encodings = [ UserQueryEncoding_bin def ]
+      }
+    assertBadQuery "can't store derived facts" r
+  ]
+  where
+  -- 1 -> 2 -> 3 -> 4, 10 -> 11
+  withGraph :: (Env -> Repo -> DbSchema -> IO ()) -> IO ()
+  withGraph = withSchemaAndFacts []
+    [s|
+      schema x.1 {
+        type Node = nat
+        predicate Edge : { from: Node, to: Node }
+        predicate Path : { from: Node, to: Node }
+          { A, B } where
+            x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+      }
+      schema all.1 : x.1 {}
+    |]
+    [ mkBatch (PredicateRef "x.Edge" 1)
+        [ [s|{ "key": { "from": 1, "to": 2 } }|]
+        , [s|{ "key": { "from": 2, "to": 3 } }|]
+        , [s|{ "key": { "from": 3, "to": 4 } }|]
+        , [s|{ "key": { "from": 10, "to": 11 } }|]
+        ]
+    ]
+
+assertBadQuery :: String -> Either BadQuery a -> IO ()
+assertBadQuery expected r = case r of
+  Left (BadQuery err) ->
+    assertBool ("error should mention " <> expected <> ":\n" <> unpack err) $
+      expected `isInfixOf` unpack err
+  Right _ -> assertFailure "the query was accepted"
+
 -- | How many facts of a predicate a query searched
 factsSearched
   :: DbSchema
@@ -1277,4 +1476,5 @@ main = withUnitTest $ testRunner $ TestList
   , TestLabel "stratification" stratificationTest
   , TestLabel "stored predicates" storedTest
   , TestLabel "reference" referenceTest
+  , TestLabel "query-local predicates" localTest
   ]

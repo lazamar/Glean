@@ -353,6 +353,16 @@ struct FactSet final : public Define {
   struct Index;
   OnDemand<Index> index;
 
+  /// The ids of the facts of each predicate, in increasing order, for finding
+  /// the facts of a predicate within a range of ids. Recursive queries do
+  /// that to find the facts derived in a round of their evaluation. It is
+  /// lazily initialised and brought up to date with the facts added since.
+  struct IdIndex;
+  OnDemand<IdIndex> id_index;
+
+  /// The facts of a predicate with ids in [from, to)
+  std::unique_ptr<FactIterator> factsWithin(Pid type, Id from, Id to);
+
   std::unique_ptr<FactIterator>
   seek(Pid type, folly::ByteRange start, size_t prefix_size);
 };

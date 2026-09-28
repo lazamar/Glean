@@ -518,6 +518,42 @@ TEST(FactSetTest, SeekWithinSectionNarrowBoundsWithoutPrefix) {
   EXPECT_EQ(collectKeys(*empty), std::vector<std::string>{});
 }
 
+TEST(FactSetTest, SeekWithinSectionSurvivesFactsAddedDuringIteration) {
+  FactSet fs(Id::lowest());
+  std::vector<std::string> keys;
+  for (int i = 0; i < 10; ++i) {
+    keys.push_back("k" + std::to_string(i));
+  }
+  auto define = [&](const std::string& key) {
+    return fs.define(
+        Pid::lowest(),
+        Fact::Clause::from(
+            folly::ByteRange(
+                reinterpret_cast<const unsigned char*>(key.data()), key.size()),
+            key.size()));
+  };
+  auto first = define(keys[0]);
+  define(keys[1]);
+  define(keys[2]);
+
+  // Search the first two facts, and add many facts of the same predicate
+  // while doing so.
+  auto iter = fs.seekWithinSection(
+      Pid::lowest(), folly::ByteRange(), first, first + 2, std::nullopt);
+  std::vector<std::string> found;
+  for (auto ref = iter->get(); ref; iter->next(), ref = iter->get()) {
+    found.push_back(ref.key().str());
+    for (int i = 3; i < 10; ++i) {
+      define(keys[i] + "-" + std::to_string(found.size()));
+    }
+    // updates the index
+    fs.seekWithinSection(
+        Pid::lowest(), folly::ByteRange(), first, first + 1, std::nullopt);
+  }
+  const std::vector<std::string> expected{"k0", "k1"};
+  EXPECT_EQ(found, expected);
+}
+
 TEST(FactSetTest, SeekWithinSectionCantRestartNarrowBounds) {
   FactSet fs(Id::lowest());
   unsigned char d1[] = "abc";

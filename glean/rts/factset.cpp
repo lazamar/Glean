@@ -283,17 +283,74 @@ std::unique_ptr<FactIterator> FactSet::seekWithinSection(
   if (count == 0 || hi <= lo) {
     return std::make_unique<EmptyIterator>();
   }
-  if (prefix.empty() && distance(lo, hi) < count) {
-    // The facts in the range are contiguous, so when there are fewer of them
-    // than facts of the predicate, look at those.
-    return FactIterator::filter(enumerate(lo, hi), [this, type](Id id) {
-      return typeById(id) == type;
-    });
+  if (prefix.empty()) {
+    return factsWithin(type, lo, hi);
   } else {
     return FactIterator::filter(
         seek(type, prefix, prefix.size()),
         [lo, hi](Id id) { return lo <= id && id < hi; });
   }
+}
+
+struct FactSet::IdIndex {
+  struct Data {
+    /// The ids of the facts of each predicate. std::unordered_map doesn't
+    /// move its values, so iterators can keep a reference to a vector while
+    /// facts are added.
+    std::unordered_map<Pid, std::vector<Id>, folly::hasher<Pid>> ids;
+
+    /// Index in 'facts' up to which 'ids' is up to date
+    size_t upto = 0;
+  };
+  folly::Synchronized<Data> data;
+};
+
+std::unique_ptr<FactIterator> FactSet::factsWithin(Pid type, Id from, Id to) {
+  struct Iterator final : FactIterator {
+    // Positions in 'ids' rather than iterators, because facts (and so ids)
+    // can be added while we iterate, which can reallocate the vector.
+    Iterator(const Facts& f, const std::vector<Id>& i, size_t p, size_t e)
+        : facts(f), ids(i), pos(p), end(e) {}
+
+    void next() override {
+      assert(pos < end);
+      ++pos;
+    }
+
+    Fact::Ref get(Demand) override {
+      return pos < end ? facts[distance(facts.startingId(), ids[pos])]
+                       : Fact::Ref::invalid();
+    }
+
+    std::optional<Id> lower_bound() override {
+      return std::nullopt;
+    }
+    std::optional<Id> upper_bound() override {
+      return std::nullopt;
+    }
+
+    const Facts& facts;
+    const std::vector<Id>& ids;
+    size_t pos;
+    const size_t end;
+  };
+
+  auto wlock = id_index.value().data.wlock();
+  for (auto i = wlock->upto; i < facts.size(); ++i) {
+    const auto fact = facts[i];
+    wlock->ids[fact.type].push_back(fact.id);
+  }
+  wlock->upto = facts.size();
+
+  const auto p = wlock->ids.find(type);
+  if (p == wlock->ids.end()) {
+    return std::make_unique<EmptyIterator>();
+  }
+  const auto& ids = p->second;
+  const auto begin = std::lower_bound(ids.begin(), ids.end(), from);
+  const auto end = std::lower_bound(begin, ids.end(), to);
+  return std::make_unique<Iterator>(
+      facts, ids, begin - ids.begin(), end - ids.begin());
 }
 
 Id FactSet::define(Pid type, Fact::Clause clause, Id) {

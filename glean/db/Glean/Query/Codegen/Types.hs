@@ -89,15 +89,22 @@ data CgStatement_ var
     , then_ :: [CgStatement_ var]
     , else_ :: [CgStatement_ var]
     }
-  | CgRec [CgStatement_ var] [CgDerivation] [PidRef]
-    -- ^ Derive the facts of recursive predicates that have been
-    -- demanded. The statements run first and create a demand. Then we run
-    -- the queries in rounds, creating facts from their results, until a
-    -- round creates no new facts. Each query has its own variables, and
+  | CgRec
+      [CgStatement_ var]
+      [CgDerivation]
+      [PidRef]
+      [CgStatement_ var]
+    -- ^ Evaluate a call to a recursive predicate. The first statements
+    -- run first and create the call's demand. Then we run the queries in
+    -- rounds, creating facts from their results, until a round creates no
+    -- new facts. After each round, the last statements produce the facts
+    -- the round derived for the call, and the statements that follow the
+    -- CgRec run for each of them. Each query has its own variables, and
     -- none of them are visible to the statements that follow. The given
     -- predicates are the auxiliary predicates of the evaluation (demands,
     -- suspensions and supplies), and their facts are kept in a store of
-    -- its own (see Note [Isolation] in Glean.Query.Recursion).
+    -- its own. See Note [Streaming] and Note [Isolation] in
+    -- Glean.Query.Recursion.
     -- See Note [Evaluating recursive predicates] and
     -- Note [Semi-naive evaluation] in Glean.Query.Recursion.
   deriving (Show, Functor, Foldable, Traversable)
@@ -364,13 +371,14 @@ instance Display CgStatement where
       , nest 2 $ sep ["then", doStmts then_]
       , nest 2 $ sep ["else", doStmts else_]
       ]
-    CgRec first queries _ -> hang 2 $ sep
+    CgRec first queries _ yield -> hang 2 $ sep
       [ "rec" <+> doStmts first
       , "("
       , sep $ punctuate ";"
           [ hang 2 $ sep [display opts pid <+> "<-", display opts (qiQuery q)]
           | CgDerivation pid _ q <- queries ]
       , ")"
+      , "yield" <+> doStmts yield
       ]
     where
       doStmts stmts = hang 2 $

@@ -45,15 +45,16 @@ Calls to derived predicates are normally inlined, but we can't do that
 for recursive predicates because the expansion would never end. Instead
 we flatten a call to a recursive predicate into a search for its facts,
 as if it were a stored predicate. Then, after the query is reordered, we
-derive the facts that the search needs just before it runs. For a call
+replace that search with an evaluation that derives the facts it needs.
+For a call
 
   P { "a", X }
 
 we generate
 
   rec ( _ = Demand_P_bf <- { "a" } )       -- 1. record what the call needs
-    ( ... );                                -- 2. derive it
-  P { "a", X }                              -- 3. search for it
+    ( ... )                                 -- 2. derive it
+    yield ( ... )                           -- 3. produce the facts found
 
 1. The binding pattern of the call says which fields of the key are
    bound when the call runs. Here the first field is bound (b) and the
@@ -95,16 +96,48 @@ we generate
    facts] in Glean.Query.UserQuery), and we would then derive more facts
    from them.
 
-3. The search then finds the facts that match the call.
+3. After each round, we match the facts derived for the call in that
+   round against the call's pattern, and run the rest of the query for
+   each of them before starting the next round (see Note [Streaming]).
 
 This is the Magic Sets transformation. Evaluation is bottom-up, but we
 only derive facts that are relevant to the call. Binding patterns come
 from the final order of the statements, so the result is correct
 whatever the order. The order only affects how much gets derived.
+-}
 
-We only get results once the saturation is complete. Demands and derived
-facts are kept until the end of the query, so later calls that need the
-same facts will find them already there.
+{- Note [Streaming]
+
+A call to a recursive predicate is a generator (section 2 of the
+design). Its results come out as they are derived, rather than once the
+evaluation has finished. We schedule by rounds. After each round of the
+evaluation we run the rest of the query for each fact that round derived
+for the call, and then start the next round.
+
+The facts derived for the call are those with a new Supply fact for the
+call's demand. A Supply fact is only created once, no matter how many
+ways its fact is derived, so each fact is produced only once (unique
+production, section 11 of the design). We look them up and match them
+against the call's pattern with the same statements that find the facts
+for a suspended derivation (see Note [Suspension]). The call's pattern
+can be more specific than its binding pattern.
+
+To find them we go through the round's new Supply facts and keep those
+for the call's demand. Searching for the Supply facts of the demand
+within the round would be quadratic in the number of rounds, because a
+search with a key prefix in a range of ids goes through every fact with
+that prefix and skips those outside the range
+(FactSet::seekWithinSection). Every round would go through every fact
+derived for the call so far. Going through the round's new Supply facts
+uses the index of facts by id instead, and over the whole evaluation it
+visits each Supply fact once.
+
+Streaming lets a query stop an evaluation early. For example, a negation
+stops at its first result, and a query that reaches a limit returns the
+results it has so far (it can't be continued, see noContinuation in
+Glean.Query.UserQuery). It also means that the rest of the query can
+make a call with a demand that the evaluation in progress has already
+created, which is why evaluations are isolated (see Note [Isolation]).
 -}
 
 {- Note [Suspension]
@@ -193,10 +226,10 @@ design's rec) keeps its auxiliary facts in a store of its own (section
 10 of the design). These are its demands, Supply facts and Suspended
 facts. The store is freed when the evaluation finishes (section 12).
 
-This matters once results stream out of an evaluation before it
-finishes (section 2). Another evaluation with the same demand could find
-the demand already there, assume it was fully evaluated, and miss
-results. It also stops the auxiliary facts of different evaluations
+This matters because results stream out of an evaluation before it
+finishes (see Note [Streaming]). Another evaluation with the same demand
+could find the demand already there, assume it was fully evaluated, and
+miss results. It also stops the auxiliary facts of different evaluations
 from filling up the query's fact set.
 
 The facts of the recursive predicates themselves are shared. They go in
@@ -279,16 +312,12 @@ type V a = StateT Int (StateT ExpandState (Except Text)) a
 expandQuery :: Maybe Int -> CodegenQuery -> E CodegenQuery
 expandQuery inside query@QueryWithInfo{..} = do
   let CgQuery hd stmts = qiQuery
-  ((stmts', lookup), numVars) <- flip runStateT qiNumVars $ do
-    stmts' <- expandStmts inside stmts
-    -- The generator of the result is searched after the statements, see
-    -- compileQuery.
-    lookup <- case qiGenerator of
-      Just (FactGenerator (PidRef _ ref) key _ _) -> call inside ref key
-      _ -> return []
-    return (stmts', lookup)
+  -- The generator of the result (qiGenerator), if any, looks up a fact
+  -- that the statements have already found (see Note [query result] in
+  -- Glean.Query.Flatten), so it needs no evaluation.
+  (stmts', numVars) <- flip runStateT qiNumVars $ expandStmts inside stmts
   return query
-    { qiQuery = CgQuery hd (stmts' <> lookup)
+    { qiQuery = CgQuery hd stmts'
     , qiNumVars = numVars
     }
 
@@ -296,9 +325,7 @@ expandStmts :: Maybe Int -> [CgStatement] -> V [CgStatement]
 expandStmts inside = fmap concat . mapM expandStmt
   where
   expandStmt stmt = case stmt of
-    CgStatement _ (FactGenerator (PidRef _ ref) key _ _) -> do
-      before <- call inside ref key
-      return (before <> [stmt])
+    CgStatement _ FactGenerator{} -> call inside stmt
     CgStatement{} -> return [stmt]
     CgAllStatement var expr stmts ->
       one $ CgAllStatement var expr <$> expandStmts inside stmts
@@ -315,14 +342,18 @@ expandStmts inside = fmap concat . mapM expandStmt
 
   one = fmap (:[])
 
--- | The statements to run before searching for facts of a predicate with a
--- key pattern. They create the demand and derive the facts, unless the
--- query we are in is already doing that.
-call :: Maybe Int -> PredicateId -> Pat -> V [CgStatement]
-call inside ref key = do
+-- | The statements that replace a search for facts. If it's a call to a
+-- recursive predicate, we create its demand and evaluate it. If the query
+-- we are in evaluates the same component, we leave the search to be
+-- suspended instead (Note [Suspension]).
+call :: Maybe Int -> CgStatement -> V [CgStatement]
+call inside search = do
   dbSchema <- lift $ gets exSchema
+  (ref, key) <- case search of
+    CgStatement _ (FactGenerator (PidRef _ ref) key _ _) -> return (ref, key)
+    _ -> throwError "internal error: call"
   case HashMap.lookup ref (recursiveComponents dbSchema) of
-    Nothing -> return []
+    Nothing -> return [search]
     Just component -> do
       details <- lift $ getDetails ref
       let
@@ -339,12 +370,32 @@ call inside ref key = do
             { exRequired = Set.insert this (exRequired s)
             , exOwnCalls = IntMap.insert (varId fid) this (exOwnCalls s)
             }
-          return [create]
+          return [create, search]
         else do
           derivations <- lift $ componentDerivations this
           auxiliary <- lift $ gets $
             IntMap.findWithDefault [] (componentIndex component) . exAuxiliary
-          return [CgRec [create] derivations auxiliary]
+          supply <- lift $ supplyPredicate this
+          fact <- freshVar (Angle.PredicateTy () (pidRef details))
+          suppliedFor <- freshVar (Angle.PredicateTy () demand)
+          let
+            -- the facts derived for the call in this round. We go through
+            -- the round's new Supply facts and keep those for the call's
+            -- demand rather than searching for the demand's Supply facts
+            -- (see Note [Streaming]).
+            supplied =
+              [ CgStatement
+                  (Ref (MatchWild (Angle.PredicateTy () supply)))
+                  (FactGenerator supply
+                    (Tuple [Ref (MatchBind suppliedFor), Ref (MatchBind fact)])
+                    (Tuple [])
+                    SeekOnRoundNew)
+              , CgStatement (Ref (MatchVar suppliedFor))
+                  (TermGenerator (Ref (MatchVar fid)))
+              ]
+          return
+            [CgRec [create] derivations auxiliary
+              (supplied <> found search fact)]
 
 freshVar :: Monad m => Type -> StateT Int m Var
 freshVar ty = do
@@ -598,9 +649,8 @@ suspend this demand query ownCalls = do
 resume :: IntMap Suspension -> Suspension -> V [CgStatement]
 resume suspensions Suspension{..} = do
   let Site{..} = suspSite
-  (lhs, called, key, value) <- case siteSearch of
-    CgStatement lhs (FactGenerator called key value _) ->
-      return (lhs, called, key, value)
+  called <- case siteSearch of
+    CgStatement _ (FactGenerator called _ _ _) -> return called
     _ -> throwError "internal error: resume: unexpected call"
   supply <- lift $ supplyPredicate siteCall
   fact <- freshVar (Angle.PredicateTy () called)
@@ -622,12 +672,19 @@ resume suspensions Suspension{..} = do
       , [ suspended (bind siteDemand) SeekOnRoundNew
         , supplied (use siteDemand) SeekOnRoundOld ]
       ]
-    -- the fact derived for the call, matched against the call's pattern
-    found =
-      [ CgStatement lhs (TermGenerator (use fact)) | not (isWild lhs) ] <>
-      [ CgStatement (use fact) (FactGenerator called key value SeekOnAllFacts) ]
-  return (resumed : found <> suspendCalls suspensions siteRest)
+  return (resumed : found siteSearch fact <> suspendCalls suspensions siteRest)
+
+-- | Given a search for facts and a variable holding a fact found for it by
+-- other means, the statements that match the fact against the search as
+-- the search would have.
+found :: CgStatement -> Var -> [CgStatement]
+found search fact = case search of
+  CgStatement lhs (FactGenerator called key value _) ->
+    [ CgStatement lhs (TermGenerator (use fact)) | not (isWild lhs) ] <>
+    [ CgStatement (use fact) (FactGenerator called key value SeekOnAllFacts) ]
+  _ -> error "internal error: found"
   where
+  use = Ref . MatchVar
   isWild (Ref MatchWild{}) = True
   isWild _ = False
 
@@ -732,4 +789,4 @@ freeVars bound0 = foldl' step (bound0, IntSet.empty)
       in
       ( IntSet.union boundThen boundElse
       , IntSet.unions [freeCond, freeThen, freeElse] )
-    CgRec first _ _ -> freeVars bound first
+    CgRec first _ _ yield -> freeVars bound (first <> yield)

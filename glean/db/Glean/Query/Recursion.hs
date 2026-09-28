@@ -185,9 +185,37 @@ see the facts derived during the current round (the snapshot of section
 
 The first round starts before the statements that create the demand of
 the call (the first argument of the design's two-argument rec), so it
-only looks at that demand. If the demand already existed, nothing is new
-and the saturation stops straight away: the facts it needs were derived
-by an earlier call.
+only looks at that demand. The demand is always new, since each
+evaluation starts with an empty store (Note [Isolation]).
+-}
+
+{- Note [Isolation]
+
+Each evaluation of a call to a recursive predicate (each CgRec, the
+design's rec) keeps its auxiliary facts -- demands, Supply facts and
+Suspended facts -- in a store of its own (section 10 of the design). The
+store is freed when the evaluation finishes (section 12).
+
+This matters once results stream out of an evaluation before it finishes
+(section 2): another evaluation with the same demand could find the demand
+already there, take it as fully evaluated, and miss results. It also keeps
+the auxiliary facts of different evaluations from filling up the query's
+fact set.
+
+The facts of the recursive predicates themselves are shared: they go in the
+query's fact set like any other derived facts, since they are the results.
+Whether a demand has been fully evaluated is only recorded by the auxiliary
+facts, so sharing derived facts can't make an evaluation stop early.
+
+The cost is that evaluations no longer share work: a call with a demand
+that an earlier call evaluated derives its facts again. Caching completed
+demands (section 14) can bring the sharing back.
+
+A store lives on the query's iterator stack, so an evaluation that is left
+early (e.g. when a negation finds a result) frees its store together with
+its iterators. The auxiliary predicates of a component are listed in its
+CgRec, and code generation routes their facts, searches and lookups
+to the store of the evaluation being compiled.
 -}
 
 -- | Derive the facts of the recursive predicates that a query searches
@@ -212,6 +240,7 @@ expandRecursion dbSchema compile query
     , exDerivations = Map.empty
     , exRequired = Set.empty
     , exOwnCalls = IntMap.empty
+    , exAuxiliary = IntMap.empty
     }
 
 -- | Which fields of the key of a predicate are bound at a call. For a
@@ -238,6 +267,9 @@ data ExpandState = ExpandState
     -- queries for
   , exOwnCalls :: IntMap Call
     -- ^ those calls, by the variable of the demand fact they create
+  , exAuxiliary :: IntMap [PidRef]
+    -- ^ the auxiliary predicates of each component, by its index. Their
+    -- facts live in the store of an evaluation, see Note [Isolation].
   }
 
 type E a = StateT ExpandState (Except Text) a
@@ -313,7 +345,9 @@ call inside ref key = do
           return [create]
         else do
           derivations <- lift $ componentDerivations this
-          return [CgRec [create] derivations]
+          auxiliary <- lift $ gets $
+            IntMap.findWithDefault [] (componentIndex component) . exAuxiliary
+          return [CgRec [create] derivations auxiliary]
 
 freshVar :: Monad m => Type -> StateT Int m Var
 freshVar ty = do
@@ -375,7 +409,7 @@ demandPredicate this@(ref, binding) = do
           Nothing
             | and binding -> keyTy
             | otherwise -> Angle.RecordTy []
-      demand <- auxiliaryPredicate (callName "demand" this) demandTy
+      demand <- auxiliaryPredicate this (callName "demand" this) demandTy
       modify $ \s -> s { exDemands = Map.insert this demand (exDemands s) }
       return demand
 
@@ -389,7 +423,8 @@ supplyPredicate this@(ref, _) = do
     Nothing -> do
       details <- getDetails ref
       demand <- demandPredicate this
-      supply <- auxiliaryPredicate (callName "supply" this) $ Angle.RecordTy
+      supply <- auxiliaryPredicate this (callName "supply" this) $
+        Angle.RecordTy
         [ Angle.FieldDef "demand" (Angle.PredicateTy () demand)
         , Angle.FieldDef "fact" (Angle.PredicateTy () (pidRef details))
         ]
@@ -402,9 +437,14 @@ callName kind (ref, binding) =
   kind <> ":" <> showRef (predicateIdRef ref) <> ":" <>
   Text.pack [ if bound then 'b' else 'f' | bound <- binding ]
 
--- | A predicate that only exists while the query runs
-auxiliaryPredicate :: Text -> Type -> E PidRef
-auxiliaryPredicate name keyTy = do
+-- | A predicate that only exists while the query runs, for the evaluation
+-- of the component of a call. See Note [Isolation].
+auxiliaryPredicate :: Call -> Text -> Type -> E PidRef
+auxiliaryPredicate (owner, _) name keyTy = do
+  component <- gets (HashMap.lookup owner . recursiveComponents . exSchema)
+  index <- case component of
+    Just c -> return (componentIndex c)
+    Nothing -> throwError "internal error: auxiliaryPredicate"
   pid <- gets exNextPid
   let
     ref = PredicateId (PredicateRef name 0) hash0
@@ -422,6 +462,8 @@ auxiliaryPredicate name keyTy = do
   modify $ \s -> s
     { exNextPid = succ pid
     , exSchema = addPredicate details (exSchema s)
+    , exAuxiliary =
+        IntMap.insertWith (<>) index [PidRef pid ref] (exAuxiliary s)
     }
   return (PidRef pid ref)
 
@@ -527,7 +569,7 @@ suspend this demand query ownCalls = do
       let
         live = liveVars (siteSearch site : siteRest site) result
         demandTy = varType (siteDemand site)
-      predicate <- lift $ auxiliaryPredicate
+      predicate <- lift $ auxiliaryPredicate this
         (callName "suspended" this <> ":" <> Text.pack (show n))
         (Angle.RecordTy
           [ Angle.FieldDef (Text.pack ("f" <> show i)) ty
@@ -691,4 +733,4 @@ freeVars bound0 = foldl' step (bound0, IntSet.empty)
       in
       ( IntSet.union boundThen boundElse
       , IntSet.unions [freeCond, freeThen, freeElse] )
-    CgRec first _ -> freeVars bound first
+    CgRec first _ _ -> freeVars bound first

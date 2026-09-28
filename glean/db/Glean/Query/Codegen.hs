@@ -147,7 +147,7 @@ findOutputs stmts = findOutputsStmts stmts IntSet.empty
   findOutputsStmt (CgConditional cond then_ else_) r =
      foldr (flip (foldr findOutputsStmt)) r [cond, then_, else_]
   -- the queries have their own variables
-  findOutputsStmt (CgRec first _) r = foldr findOutputsStmt r first
+  findOutputsStmt (CgRec first _ _) r = foldr findOutputsStmt r first
 
   findOutputsGen :: Generator -> IntSet -> IntSet
   findOutputsGen (FactGenerator _ kpat vpat _) r =
@@ -545,28 +545,37 @@ compileStatements
         fail <- label
         return a
 
-      -- Run the first statements, then run the queries in rounds until a
-      -- round derives no new facts. Facts are never removed, and new facts
-      -- get increasing ids, so the facts derived in a round are the ones
-      -- with ids from the first free id at its start to the first free id
-      -- at its end.
+      -- Create a store for the auxiliary facts of the evaluation (see
+      -- Note [Isolation] in Glean.Query.Recursion) and run the first
+      -- statements, then run the queries in rounds until a round derives no
+      -- new facts. Facts are never removed, and new facts get increasing
+      -- ids, so the auxiliary facts derived in a round are the ones in the
+      -- store with ids from its first free id at the start of the round to
+      -- its first free id at the end.
       -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
-      compile (CgRec first queries : rest) =
-        local $ \roundStart roundEnd -> do
-        firstFreeId roundStart
-        compileStatements syscalls qtrans bounds regs first vars $ mdo
+      compile (CgRec first queries auxiliary : rest) =
+        local $ \store roundStart roundEnd -> do
+        newStore store
+        let
+          pids = IntSet.fromList
+            [ fromIntegral (fromPid pid) | PidRef pid _ <- auxiliary ]
+          recRegs = regs { recStore = Just (store, pids) }
+        storeFirstFreeId store roundStart
+        compileStatements syscalls qtrans bounds recRegs first vars $ mdo
           loop <- label
-          firstFreeId roundEnd
+          storeFirstFreeId store roundEnd
           local $ \new -> do
             move roundEnd new
             sub roundStart new
             jumpIf0 new done
           -- the facts derived since roundStart are new in this round
-          let thisRound = regs { roundRange = Just (roundStart, roundEnd) }
+          let thisRound = recRegs { roundRange = Just (roundStart, roundEnd) }
           forM_ queries $ compileDerivation thisRound qtrans bounds
           move roundEnd roundStart
           jump loop
           done <- label
+          -- free the store
+          endSeek store
           compile rest
 
       -- an empty list of generators should fall through without
@@ -658,7 +667,9 @@ compileStatements
               patOutput (preProcessPat vpat') $ \vout vcmp -> do
                 reg <- load fail
                 local $ \pidReg -> mdo
-                  lookupKeyValue reg kout vout pidReg
+                  case storeOf regs pid of
+                    Just store -> storeLookupKeyValue store reg kout vout pidReg
+                    Nothing -> lookupKeyValue reg kout vout pidReg
                   -- TODO: if this is a trusted fact ID (i.e. not supplied by
                   -- the user) then we could skip this test.
                   expectedReg <- constant (fromIntegral (fromPid expected))
@@ -939,23 +950,27 @@ compileStatements
           isEmpty (Tuple []) = True
           isEmpty _ = False
 
+          newFact = case storeOf regs pid of
+            Just store -> storeNewFact store
+            Nothing -> newDerivedFact
+
         local $ \size -> do
 
         if
           | isEmpty val ->
             withTerm vars key $ \out -> do
               getOutputSize out size
-              newDerivedFact rpid out size resultReg
+              newFact rpid out size resultReg
           | isEmpty key ->
             withTerm vars val $ \out -> do
               getOutputSize out size
-              newDerivedFact rpid out size resultReg
+              newFact rpid out size resultReg
           | otherwise ->
             output $ \out -> do
               buildTerm out vars key
               getOutputSize out size
               buildTerm out vars val
-              newDerivedFact rpid out size resultReg
+              newFact rpid out size resultReg
 
         inner
 
@@ -1057,7 +1072,18 @@ compileFactGenerator mtrans bounds qregs@QueryRegs{..}
   endSeek seekTok
   return a
   where
-    seek' typ ptr end tok =
+    seek' typ ptr end tok
+      | Just store <- storeOf qregs pid = do
+        (from, to) <- case section of
+          SeekOnAllFacts -> (,) <$> constant 0 <*> constant maxBound
+          SeekOnRoundNew | Just (from, to) <- roundRange -> return (from, to)
+          SeekOnRoundOld | Just (from, _) <- roundRange ->
+            (,) <$> constant 0 <*> return from
+          SeekOnRoundAll | Just (_, to) <- roundRange ->
+            (,) <$> constant 0 <*> return to
+          _ -> error "compileFactGenerator: unexpected seek on a store"
+        storeSeekWithinSection store typ ptr end from to tok
+      | otherwise =
       case (section, bounds) of
         (SeekOnAllFacts, _) -> seek typ ptr end tok
         (SeekOnBase, StackedBoundaries (SectionBoundaries from to) _) ->
@@ -1084,6 +1110,15 @@ compileFactGenerator mtrans bounds qregs@QueryRegs{..}
           pto <- constant $ fromIntegral $ fromFid to
           seekWithinSection typ ptr end pfrom pto tok
 
+
+-- | The store holding the facts of a predicate, if it's an auxiliary
+-- predicate of the evaluation we're compiling. See Note [Isolation] in
+-- Glean.Query.Recursion.
+storeOf :: QueryRegs -> Pid -> Maybe (Register 'Word)
+storeOf QueryRegs{..} pid = case recStore of
+  Just (store, pids) | fromIntegral (fromPid pid) `IntSet.member` pids ->
+    Just store
+  _ -> Nothing
 
 -- ^ Extract a prefix to be searched and create code to match on the key and
 -- value of facts searched.
@@ -1739,6 +1774,7 @@ generateQueryCode f = generate Optimised $
         store id (castRegister kout) (castRegister vout) pid
 
     roundRange = Nothing
+    recStore = Nothing
 
   in
     f QueryRegs{..}

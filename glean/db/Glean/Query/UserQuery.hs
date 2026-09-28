@@ -604,7 +604,9 @@ userQueryWrites env odb config bounds lookup repo pred q = do
             SeekOnBase -> hasFacts pid baseStats
             SeekOnStacked -> hasFacts pid topStats
             -- only the facts derived by a recursive query
-            SeekOnRound -> True
+            SeekOnRoundNew -> True
+            SeekOnRoundOld -> True
+            SeekOnRoundAll -> True
       return pidHasFacts
 
     stats opts =
@@ -1015,7 +1017,7 @@ compileAngleQuery rec ver dbSchema mode source stored debug = do
   -- See Note [Evaluating recursive predicates] in Glean.Query.Recursion
   withRecursion <- checkBadQuery id $ runExcept $
     expandRecursion dbSchema
-      (\schema query -> reorder schema =<< optimise query)
+      (\schema bound query -> reorderWithBound schema bound =<< optimise query)
       final
   when (usesRecursion withRecursion) $
     ifDebug $ "with recursive predicates: " <>

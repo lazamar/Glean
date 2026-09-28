@@ -134,8 +134,10 @@ data QueryRegs = QueryRegs
     -- | Unused, temporarily kept for backwards compatibility
   , saveState :: Register 'Word
 
-    -- | The range of fact ids that 'SeekOnRound' searches, when
-    -- compiling the queries of a saturation.
+    -- | When compiling the queries of a saturation, the range of ids of
+    -- the facts derived by the previous round, which 'SeekOnRoundNew'
+    -- searches. 'SeekOnRoundOld' searches the ids before it, and
+    -- 'SeekOnRoundAll' both.
     -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
   , roundRange :: Maybe (Register 'Word, Register 'Word)
 

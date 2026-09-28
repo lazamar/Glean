@@ -28,7 +28,6 @@ import Data.Coerce
 import Data.IntSet (IntSet)
 import qualified Data.IntSet as IntSet
 import Data.List (find,genericLength)
-import Data.List.Extra (nubOrdOn)
 import Data.Maybe
 import qualified Data.Text as Text
 import qualified Data.Vector as Vector
@@ -548,42 +547,23 @@ compileStatements
 
       -- Run the first statements, then run the queries in rounds until a
       -- round derives no new facts. Facts are never removed, and new facts
-      -- get increasing ids, so the facts derived since a point are the ones
-      -- with ids from the first free id at that point.
+      -- get increasing ids, so the facts derived in a round are the ones
+      -- with ids from the first free id at its start to the first free id
+      -- at its end.
       -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
       compile (CgRec first queries : rest) =
-        local $ \roundStart roundEnd rangeStart component -> mdo
+        local $ \roundStart roundEnd -> do
         firstFreeId roundStart
         compileStatements syscalls qtrans bounds regs first vars $ mdo
-          -- facts derived since roundStart are new in this round
           loop <- label
           firstFreeId roundEnd
           local $ \new -> do
             move roundEnd new
             sub roundStart new
             jumpIf0 new done
-
-          -- Were there new facts of the predicates being derived? We
-          -- search for them within the new range.
-          loadConst 0 component
-          let newRange = regs { roundRange = Just (roundStart, roundEnd) }
-          forM_ (derivedPredicates queries) $ \(pid, keyTy, valTy) ->
-            compileStatements newRange qtrans bounds newRange
-              [ CgStatement (Ref (MatchWild (Angle.PredicateTy () pid)))
-                  (FactGenerator pid (Ref (MatchWild keyTy))
-                    (Ref (MatchWild valTy)) SeekOnRound)
-              ]
-              Vector.empty
-              (loadConst 1 component)
-
-          -- If there were, consider all demands, otherwise only new ones
-          move roundStart rangeStart
-          jumpIf0 component onlyNew
-          loadConst 0 rangeStart
-          onlyNew <- label
-          let demands = regs { roundRange = Just (rangeStart, roundEnd) }
-          forM_ queries $ compileDerivation demands qtrans bounds
-
+          -- the facts derived since roundStart are new in this round
+          let thisRound = regs { roundRange = Just (roundStart, roundEnd) }
+          forM_ queries $ compileDerivation thisRound qtrans bounds
           move roundEnd roundStart
           jump loop
           done <- label
@@ -1084,11 +1064,21 @@ compileFactGenerator mtrans bounds qregs@QueryRegs{..}
           seekBetween from to
         (SeekOnStacked, StackedBoundaries _ (SectionBoundaries from to)) ->
           seekBetween from to
-        (SeekOnRound, _) | Just (from, to) <- roundRange ->
+        (SeekOnRoundNew, _) | Just (from, to) <- roundRange ->
           seekWithinSection typ ptr end from to tok
-        (SeekOnRound, _) -> error "SeekOnRound outside of a saturation"
+        (SeekOnRoundOld, _) | Just (from, _) <- roundRange -> do
+          start <- constant 0
+          seekWithinSection typ ptr end start from tok
+        (SeekOnRoundAll, _) | Just (_, to) <- roundRange -> do
+          start <- constant 0
+          seekWithinSection typ ptr end start to tok
+        (SeekOnRoundNew, _) -> outsideSaturation
+        (SeekOnRoundOld, _) -> outsideSaturation
+        (SeekOnRoundAll, _) -> outsideSaturation
         _ -> error "unexpected section seek on non-stacked db"
       where
+        outsideSaturation =
+          error "compileFactGenerator: seek on a round outside a saturation"
         seekBetween from to = do
           pfrom <- constant $ fromIntegral $ fromFid from
           pto <- constant $ fromIntegral $ fromFid to
@@ -1448,39 +1438,36 @@ withTerm vars term action = do
     buildTerm reg vars term
     action reg
 
--- | The predicates derived by the queries of a saturation (see CgRec),
--- and the types of their keys and values.
-derivedPredicates :: [(PidRef, CodegenQuery)] -> [(PidRef, Type, Type)]
-derivedPredicates queries = nubOrdOn (\(PidRef pid _, _, _) -> pid)
-  [ (pid, keyTy, valTy)
-  | (pid, query) <- queries
-  , Angle.RecordTy [Angle.FieldDef _ keyTy, Angle.FieldDef _ valTy] <-
-      [derefType (qiReturnType query)]
-  ]
-
--- | Run a query returning the keys and values of facts of a predicate
--- (see CgRec) to completion, creating a fact for each result.
+-- | Run a query deriving facts of a recursive predicate (see CgDerivation)
+-- to completion. For each result we create the fact, and a Supply fact
+-- recording the demand it was derived for.
 compileDerivation
   :: QueryRegs
   -> QueryTransformations
   -> Boundaries
-  -> (PidRef, CodegenQuery)
+  -> CgDerivation
   -> Code ()
-compileDerivation regs qtrans bounds (pidRef, query) =
+compileDerivation regs qtrans bounds (CgDerivation pidRef supply query) =
   case qiQuery query of
-    CgQuery (Tuple [key, val]) body -> derive key val body
+    CgQuery (Tuple [key, val, demand]) body -> derive key val demand body
     _ -> error "compileDerivation: unexpected query"
   where
-  derive key val body = do
+  derive key val demand body = do
     let
       numVars0 = qiNumVars query
-      -- Create the fact with a statement at the end, which runs for each
+      -- Create the facts with statements at the end, which run for each
       -- result of the query.
+      -- (a DerivedFactGenerator whose result isn't bound creates nothing)
       fid = Var (Angle.PredicateTy () pidRef) numVars0 Nothing
-      numVars = numVars0 + 1
+      supplied = Var (Angle.PredicateTy () supply) (numVars0 + 1) Nothing
+      numVars = numVars0 + 2
       stmts = body ++
         [ CgStatement (Ref (MatchBind fid))
-            (DerivedFactGenerator pidRef key val) ]
+            (DerivedFactGenerator pidRef key val)
+        , CgStatement (Ref (MatchBind supplied))
+            (DerivedFactGenerator supply
+              (Tuple [demand, Ref (MatchVar fid)]) (Tuple []))
+        ]
       outputVars = IntSet.toList $ findOutputs stmts
     outputUninitialized $ Many (length outputVars) $ \outputRegs ->
       local $ Many (numVars - length outputVars) $ \localRegs -> do

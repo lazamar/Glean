@@ -17,6 +17,7 @@ module Glean.Query.Codegen.Types
   , CgQuery(..)
   , CgStatement_(..)
   , CgStatement
+  , CgDerivation(..)
   , Generator_(..)
   , Generator
   , SeekSection(..)
@@ -88,20 +89,29 @@ data CgStatement_ var
     , then_ :: [CgStatement_ var]
     , else_ :: [CgStatement_ var]
     }
-  | CgRec [CgStatement_ var] [(PidRef, CodegenQuery)]
+  | CgRec [CgStatement_ var] [CgDerivation]
     -- ^ Derive the facts of recursive predicates that have been
-    -- demanded. The statements run first and create a demand. There is a
-    -- query for each predicate and binding pattern, returning the key and
-    -- value of its demanded facts. We run the queries and create facts
-    -- from their results until they stop producing new facts. Each query
-    -- has its own variables, and none of them are visible to the
-    -- statements that follow.
+    -- demanded. The statements run first and create a demand. Then we run
+    -- the queries in rounds, creating facts from their results, until a
+    -- round creates no new facts. Each query has its own variables, and
+    -- none of them are visible to the statements that follow.
     -- See Note [Evaluating recursive predicates] and
     -- Note [Semi-naive evaluation] in Glean.Query.Recursion.
   deriving (Show, Functor, Foldable, Traversable)
 
 
 type CgStatement = CgStatement_ Var
+
+-- | A query deriving facts of a recursive predicate for its demands. It
+-- returns the key and value of each fact and the demand it is for. For
+-- each result we create the fact and a Supply fact recording that it was
+-- derived for the demand. See Note [Suspension] in Glean.Query.Recursion.
+data CgDerivation = CgDerivation
+  { derivedPredicate :: PidRef
+  , derivedSupply :: PidRef
+  , derivedQuery :: CodegenQuery
+  }
+  deriving Show
 
 {- Note [why do we have sequential composition?]
 
@@ -356,7 +366,7 @@ instance Display CgStatement where
       , "("
       , sep $ punctuate ";"
           [ hang 2 $ sep [display opts pid <+> "<-", display opts (qiQuery q)]
-          | (pid, q) <- queries ]
+          | CgDerivation pid _ q <- queries ]
       , ")"
       ]
     where
@@ -374,7 +384,9 @@ instance Display Generator where
       SeekOnAllFacts -> ""
       SeekOnBase -> "<base>"
       SeekOnStacked -> "<stacked>"
-      SeekOnRound -> "<round>"
+      SeekOnRoundNew -> "<new>"
+      SeekOnRoundOld -> "<old>"
+      SeekOnRoundAll -> "<all>"
     isUnit (Tuple []) = True
     isUnit _ = False
   display opts (TermGenerator q) = display opts q

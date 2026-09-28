@@ -261,10 +261,11 @@ data SeekSection
   = SeekOnAllFacts -- ^ base + stacked + writable
   | SeekOnBase -- ^ base only
   | SeekOnStacked -- ^ stacked only
-  | SeekOnRound
-    -- ^ Only used while evaluating recursive predicates: the facts that
-    -- the current round of the enclosing saturation considers. See
-    -- Note [Semi-naive evaluation] in Glean.Query.Recursion.
+    -- The following are only used while evaluating recursive predicates,
+    -- see Note [Semi-naive evaluation] in Glean.Query.Recursion.
+  | SeekOnRoundNew -- ^ facts derived by the previous round
+  | SeekOnRoundOld -- ^ facts derived before the previous round
+  | SeekOnRoundAll -- ^ facts derived before the current round
   deriving (Eq, Show, Generic)
 
 instance Binary SeekSection

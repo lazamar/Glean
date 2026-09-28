@@ -694,7 +694,53 @@ recursionTest = TestList
         repeated <- runQ env repo
           [s| { X, Y } where x.Path { 1, X }; x.Path { 1, Y } |]
         assertEqual "Edge facts searched" (searched once) (searched repeated)
+
+  , TestLabel "resumes a derivation once for each fact" $ TestCase $ do
+    -- All the facts of x.Path { 1, _ } are derived for the same demand.
+    -- Each x.Path { 1, K } should search for the edges from K once, not
+    -- once in every round after it was derived.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> ... -> 100
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 99 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        response <- runQ env repo [s| x.Path { 1, _ } |]
+        facts <- decodeResultsAs "x.Path.1" schema response
+        assertEqual "results" 99 (length facts)
+        searched <- factsSearched schema "x.Edge.1" response
+        assertBool ("Edge facts searched: " <> show searched) $
+          searched < 200
   ]
+
+-- | How many facts of a predicate a query searched
+factsSearched
+  :: DbSchema
+  -> Text
+  -> Either BadQuery UserQueryResults
+  -> IO Int64
+factsSearched schema ref response = do
+  pid <- either (assertFailure . unpack) (return . predicatePid) $
+    lookupPredicateSourceRef (parseRef ref) LatestSchema schema
+  case response of
+    Right UserQueryResults{..} -> return $ fromMaybe 0 $ do
+      stats <- userQueryResults_stats
+      counts <- userQueryStats_facts_searched stats
+      Map.lookup (fromIntegral (RTS.fromPid pid)) counts
+    Left err -> assertFailure (show err)
 
 decodeNats :: Either BadQuery UserQueryResults -> IO [RTS.Value]
 decodeNats response =

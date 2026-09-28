@@ -94,6 +94,9 @@ data DbSchema = DbSchema
   , schemaInventory :: Inventory
     -- ^ Information about the predicates in an open DB
   , schemaMaxPid :: Pid
+  , schemaLocalPids :: Set Pid
+    -- ^ The predicates declared by the query being compiled, if any. See
+    -- Note [Query-local predicates] in Glean.Query.UserQuery.
 
   -- These two fields relate to the latest available schema. In a
   -- writable DB this will be the DB schema, but in a readable DB it

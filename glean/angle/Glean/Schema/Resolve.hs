@@ -16,6 +16,7 @@ module Glean.Schema.Resolve
   , resolveSchema
   , runResolve
   , resolveQuery
+  , resolveQueryWithPredicates
   , resolveSchemaRefs
   ) where
 
@@ -27,6 +28,7 @@ import qualified Data.ByteString as ByteString
 import Data.Char
 import Data.Graph
 import Data.Foldable
+import Data.Function (on)
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashSet as HashSet
@@ -692,6 +694,49 @@ resolveQuery (SourceQuery head stmts ord) =
     <$> mapM resolvePat head
     <*> mapM resolveStatement stmts
     <*> pure ord
+
+-- | Resolve a query and the predicates it declares. The declared
+-- predicates are in scope in the query and in all of their derivations,
+-- so they can call themselves and each other. Their names are plain
+-- (@Path@), and the names of a query's scope are qualified (@x.Path@), so
+-- they don't shadow anything. See Note [Query-local predicates] in
+-- Glean.Query.UserQuery.
+resolveQueryWithPredicates
+  :: SourceQuery
+  -> [SourcePredicateDef]
+  -> Resolve PredicateId TypeId
+      (Query_ PredicateId TypeId, [PredicateDef' SrcSpan SrcSpan])
+resolveQueryWithPredicates query decls = do
+  sequence_
+    [ prettyErrorAt (predicateDefSrcSpan decl) $
+        "predicate declared more than once: " <>
+        pretty (showRef (predicateDefRef decl))
+    | decl : _ : _ <-
+        groupBy ((==) `on` predicateDefRef) (sortOn predicateDefRef decls)
+    ]
+  let
+    ids = map (queryPredicateId . sourceRefName . predicateDefRef) decls
+    declared = HashMap.fromList
+      [ (predicateDefRef decl, Set.singleton (RefPred ref))
+      | (decl, ref) <- zip decls ids ]
+  local (\(ver, env) -> (ver, HashMap.union declared env)) $ do
+    defs <- forM (zip decls ids) $ \(decl, ref) -> do
+      key <- resolveType (predicateDefKeyType decl)
+      value <- resolveType (predicateDefValueType decl)
+      derivation <- case predicateDefDeriving decl of
+        Derive DeriveOnDemand q -> Derive DeriveOnDemand <$> resolveQuery q
+        _ -> prettyErrorAt (predicateDefSrcSpan decl) $
+          "a predicate declared in a query can't be stored or have a " <>
+          "default derivation: " <> pretty (showRef (predicateDefRef decl))
+      return PredicateDef
+        { predicateDefRef = ref
+        , predicateDefKeyType = key
+        , predicateDefValueType = value
+        , predicateDefDeriving = derivation
+        , predicateDefSrcSpan = predicateDefSrcSpan decl
+        }
+    resolved <- resolveQuery query
+    return (resolved, defs)
 
 resolvePat
   :: (ShowRef t, ShowRef p)

@@ -28,6 +28,7 @@ module Glean.Database.Schema
   , renderSchemaSource
   , toStoredVersions
   , derivationEdges
+  , addLocalPredicates
   -- testing
   , newDbSchemaForTesting
   ) where
@@ -60,7 +61,7 @@ import qualified Data.Text.Encoding as Text
 import Compat.Prettyprinter
 import Compat.Prettyprinter.Render.Text
 import Data.Tuple (swap)
-import Safe (maximumMay)
+import Safe (lastMay, maximumMay)
 import TextShow
 
 import ServiceData.GlobalStats
@@ -522,6 +523,7 @@ mkDbSchema toList cacheVar knownPids dbContent
       , schemaInventory = inventory predicates
       , schemaSource = (source, dbSchemaAllVersion, dbSchemaId)
       , schemaMaxPid = maxPid
+      , schemaLocalPids = Set.empty
       , schemaAllVersion = hashedSchemaAllVersion latestSchema
       , schemaId = hashedSchemaId latestSchema
       , derivationDepends = derivationDepends
@@ -926,6 +928,103 @@ typecheckSchema idToPid stored tcOpts HashedSchema{..} tcEnv = do
 
   return env { tcEnvPredicates = finalPreds }
 
+
+-- | The schema to compile a query with, when the query declares
+-- predicates: the DB's schema and the declared predicates. They're checked
+-- as a schema's predicates are: their derivations are typechecked, and
+-- they can't depend on their own negation. See
+-- Note [Query-local predicates] in Glean.Query.UserQuery.
+addLocalPredicates
+  :: TcOpts
+  -> [PredicateDef' SrcSpan SrcSpan]
+  -> DbSchema
+  -> ExceptT Text IO DbSchema
+addLocalPredicates _ [] dbSchema = return dbSchema
+addLocalPredicates tcOpts defs dbSchema = do
+  let
+    -- the Pids after the schema's
+    pids = zip defs [tempPid dbSchema ..]
+
+    localPid = HashMap.fromList
+      [ (predicateDefRef def, pid) | (def, pid) <- pids ]
+
+    rtsType :: ToRtsType
+    rtsType = mkRtsType
+      (\ref -> typeType <$> lookupTypeId ref dbSchema)
+      (\ref -> HashMap.lookup ref localPid
+        <|> predicatePid <$> lookupPredicateId ref dbSchema)
+
+  details <- forM pids $ \(def, pid) -> do
+    let
+      def' = rmTypeLocPredDef def
+      convert ty = case rtsType ty of
+        Just t -> return t
+        Nothing -> throwError $ "the type of " <>
+          showRef (predicateIdRef (predicateDefRef def)) <>
+          " refers to predicates that aren't in the database"
+    keyType <- convert (predicateDefKeyType def')
+    valueType <- convert (predicateDefValueType def')
+    typecheck <- liftIO $ checkSignature keyType valueType
+    traversal <- liftIO $ genTraversal keyType valueType
+    return PredicateDetails
+      { predicatePid = pid
+      , predicateId = predicateDefRef def
+      , predicateSchema = def'
+      , predicateKeyType = keyType
+      , predicateValueType = valueType
+      , predicateTraversal = traversal
+      , predicateTypecheck = typecheck
+      , predicateDeriving = NoDeriving
+      , predicateInStoredSchema = False
+      }
+
+  let
+    insertPred d = HashMap.insert (predicateId d) d
+
+    -- every declared predicate is visible in every derivation
+    env = TcEnv
+      { tcEnvPredicates = foldr insertPred (predicatesById dbSchema) details
+      , tcEnvTypes = typesById dbSchema
+      }
+
+  typechecked <- forM (zip defs details) $ \(def, d) -> do
+    derivation <- typecheckDeriving env tcOpts rtsType d
+      (predicateDefDeriving def)
+    return d { predicateDeriving = derivation }
+
+  -- Schema predicates can't depend on declared ones, so a cycle through
+  -- negation that involves a declared predicate only involves declared
+  -- predicates, and so does a recursive component.
+  let local = foldr insertPred HashMap.empty typechecked
+  liftEither $ checkStratification local
+
+  let
+    -- components are numbered in dependency order, and declared
+    -- predicates can depend on the schema's
+    firstComponent = maybe 0 succ $ maximumMay
+      [ componentIndex c | c <- HashMap.elems (recursiveComponents dbSchema) ]
+    components =
+      (\c -> c { componentIndex = firstComponent + componentIndex c })
+        <$> recursiveComponentsOf local
+
+    byPid = foldr
+      (\d -> IntMap.insert (fromIntegral (fromPid (predicatePid d))) d)
+      (predicatesByPid dbSchema)
+      typechecked
+
+  return dbSchema
+    { predicatesById = HashMap.union local (predicatesById dbSchema)
+    , predicatesByPid = byPid
+    , derivationDepends = HashMap.union
+        (HashMap.fromListWith (++)
+          [ (p, pp) | (_, p, pp) <- derivationEdges local ])
+        (derivationDepends dbSchema)
+    , recursiveComponents =
+        HashMap.union components (recursiveComponents dbSchema)
+    , schemaInventory = inventory (IntMap.elems byPid)
+    , schemaMaxPid = maybe (schemaMaxPid dbSchema) snd (lastMay pids)
+    , schemaLocalPids = Set.fromList (map snd pids)
+    }
 
 -- | Enable or disable a DeriveIfEmpty derivation based on the DB
 -- contents.

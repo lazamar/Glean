@@ -537,6 +537,114 @@ recursionTest = TestList
           ]
           (sort facts)
 
+  , TestLabel "record keys" $ TestCase $ do
+    -- The demand, Suspended, Supply and Completed facts all have record
+    -- keys here.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = { name: string, n: nat }
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- a1 -> b2 -> c3 -> d4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": { "name": "a", "n": 1 }, "to": { "name": "b", "n": 2 } } }|]
+          , [s|{ "key": { "from": { "name": "b", "n": 2 }, "to": { "name": "c", "n": 3 } } }|]
+          , [s|{ "key": { "from": { "name": "c", "n": 3 }, "to": { "name": "d", "n": 4 } } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        nodes <- decodeNats =<< runQ env repo
+          [s| N where x.Path { { "a", 1 }, { _, N } } |]
+        assertEqual "nodes reachable from a" (map RTS.Nat [2, 3, 4]) (sort nodes)
+        -- the same call again, for each result: the demand is completed
+        pairs <- decodeNats =<< runQ env repo
+          [s| M where x.Path { { "a", 1 }, _ }; x.Path { { "a", 1 }, { _, M } } |]
+        assertEqual "repeated call" (map RTS.Nat [2, 3, 4]) (nub (sort pairs))
+
+  , TestLabel "a recursive call inside all" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4, 10 -> 11
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          , [s|{ "key": { "from": 10, "to": 11 } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        sizes <- decodeNats =<< runQ env repo
+          [s| prim.size (all (X where x.Path { N, X })) where N = (1 | 10) |]
+        assertEqual "sizes of the sets of reachable nodes"
+          (map RTS.Nat [1, 3]) (sort sizes)
+
+  , TestLabel "negated recursive call in a derived predicate" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+          # nodes with an edge that 1 can't reach
+          predicate Unreachable : Node
+            N where x.Edge { N, _ }; !x.Path { 1, N }
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3, 5 -> 6
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 5, "to": 6 } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        nodes <- decodeResultsAs "x.Unreachable.1" schema =<< runQ env repo
+          [s| x.Unreachable _ |]
+        assertEqual "nodes unreachable from 1" [RTS.Nat 1, RTS.Nat 5] (sort nodes)
+
+  , TestLabel "a recursive call in the condition of an if" $ TestCase $ do
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        answers <- decodeNats =<< runQ env repo
+          [s| R where T = (4 | 7); R = if (x.Path { 1, T }) then 1 else 0 |]
+        assertEqual "4 is reachable from 1, 7 isn't"
+          (map RTS.Nat [0, 1]) (sort answers)
+
   , TestLabel "keeps values of any type across a recursive call" $
     TestCase $ do
     -- A and K are strings bound before the recursive call and used after

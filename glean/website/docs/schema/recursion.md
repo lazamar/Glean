@@ -76,6 +76,10 @@ facts> A where example.Ancestor { child = { name = "Goldfish" }, ancestor = A }
 A query can also declare its own recursive predicates, without changing
 the schema: see [Predicates declared in a query](../derived.md#predicates-declared-in-a-query).
 
+How the recursion is written makes a big difference to how efficient it
+is: see [Recursive predicates](../angle/efficiency.md#recursive-predicates)
+in Query Efficiency.
+
 ### No recursion through negation
 
 A derived predicate can't depend on its own negation, directly or

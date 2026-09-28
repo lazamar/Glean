@@ -831,6 +831,7 @@ runQuery
       case cont of
         Right ucont -> do
           let binaryCont = Thrift.userQueryCont_continuation ucont
+          when (B.null binaryCont) $ throwIO $ Thrift.BadQuery noContinuation
           results <- transformResultsBack appliedTrans <$>
             restartCompiled
               schemaInventory
@@ -874,19 +875,20 @@ runQuery
           queryResultsFacts
         else return Nothing
 
+    -- A query that evaluates recursive predicates returns the results it
+    -- has when it reaches a limit, but can't be continued: its evaluations
+    -- keep their state in stores that don't outlive the query (see
+    -- Note [Isolation] in Glean.Query.Recursion). It returns a
+    -- continuation with nothing in it, so that clients know the results
+    -- are incomplete, and resuming it is an error.
+    let incomplete = isJust queryResultsCont
+          && either usesRecursion (const False) cont
     userCont <- case queryResultsCont of
       Nothing -> return Nothing
       Just bs -> do
-        -- A continuation would resume without the facts derived for
-        -- recursive predicates, see Note [Evaluating recursive predicates]
-        -- in Glean.Query.Recursion.
-        when (either usesRecursion (const False) cont) $
-          throwIO $ Thrift.BadQuery $
-            "the query uses recursive predicates and reached one of its " <>
-            "limits (results, bytes or time), but continuing such queries " <>
-            "isn't supported yet. Please increase the limit."
         nextId <- firstFreeId derived
-        return $ Just $ mkUserQueryCont (Right returnType) bs nextId
+        let bs' = if incomplete then B.empty else bs
+        return $ Just $ mkUserQueryCont (Right returnType) bs' nextId
 
     stats <- getStats schema fullScans qResults
 
@@ -906,7 +908,8 @@ runQuery
           , resNestedFacts = mkNestedFacts queryResultsNestedFacts
           , resCont = userCont
           , resStats = stats
-          , resDiags = compileDiag ++ queryDiag
+          , resDiags = compileDiag ++ queryDiag ++
+              [ noContinuation | incomplete ]
           , resWriteHandle = maybeWriteHandle
           , resFactsSearched = Map.filterWithKey knownPid <$> queryResultsStats
           , resType = Just ppType
@@ -1031,6 +1034,14 @@ compileAngleQuery rec ver dbSchema mode source stored debug = do
   checkBadQuery txt act = case act of
     Left str -> throwIO $ Thrift.BadQuery $ txt str
     Right a -> return a
+
+-- | Why the results of a query that evaluates recursive predicates are
+-- incomplete, when it reaches a limit
+noContinuation :: Text
+noContinuation =
+  "the query uses recursive predicates and reached one of its limits " <>
+  "(results, bytes or time), and such queries can't be continued. " <>
+  "These are the results found so far; to get more, increase the limit."
 
 -- | Whether a query evaluates recursive predicates
 -- (see Note [Evaluating recursive predicates] in Glean.Query.Recursion).

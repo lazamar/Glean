@@ -469,8 +469,10 @@ recursionTest = TestList
               "recursive reference to predicate" `isInfixOf` unpack err
           Right _ -> assertFailure "query succeeded"
 
-  , TestLabel "no continuations" $ TestCase $ do
-    -- A continuation would resume without the facts derived for Path.
+  , TestLabel "results up to a limit, without continuing" $ TestCase $ do
+    -- A query that reaches a limit returns the results it found, and a
+    -- continuation that can't be resumed: the evaluations keep their state
+    -- in stores that don't outlive the query.
     withSchemaAndFacts [enableRecursion]
       [s|
         schema x.1 {
@@ -489,18 +491,33 @@ recursionTest = TestList
           ]
       ]
       $ \env repo _ -> do
-        r <- try $ userQuery env repo $ def
-          { userQuery_query = [s| x.Path _ |]
-          , userQuery_options = Just def
+        let
+          options = def
             { userQueryOptions_syntax = QuerySyntax_ANGLE
             , userQueryOptions_max_results = Just 1
             }
-          }
+          query = def
+            { userQuery_query = [s| x.Path _ |]
+            , userQuery_options = Just options
+            , userQuery_encodings = [ UserQueryEncoding_bin def ]
+            }
+          noContinuation = "can't be continued"
+        UserQueryResults{..} <- userQuery env repo query
+        case userQueryResults_results of
+          UserQueryEncodedResults_bin bin ->
+            assertEqual "results" 1 (Map.size (userQueryResultsBin_facts bin))
+          _ -> assertFailure "unexpected encoding"
+        assertBool "diagnostic" $
+          any ((noContinuation `isInfixOf`) . unpack) userQueryResults_diagnostics
+        cont <- maybe (assertFailure "no continuation") return
+          userQueryResults_continuation
+        r <- try $ userQuery env repo query
+          { userQuery_options = Just options
+              { userQueryOptions_continuation = Just cont } }
         case r of
           Left (BadQuery err) ->
-            assertBool (unpack err) $
-              "reached one of its limits" `isInfixOf` unpack err
-          Right _ -> assertFailure "query succeeded"
+            assertBool (unpack err) $ noContinuation `isInfixOf` unpack err
+          Right _ -> assertFailure "the continuation was resumed"
 
   , TestLabel "input from the call site" $ TestCase $ do
     -- The design doc's bounded recursion: Max only comes from the call

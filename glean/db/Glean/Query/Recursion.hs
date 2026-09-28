@@ -125,9 +125,9 @@ against the call's pattern, which can be more specific than the binding
 pattern.
 
 Streaming lets a query stop an evaluation early, e.g. a negation stops at
-its first result. (A result limit would too, but a query that uses
-recursive predicates can't be continued yet, so reaching a limit is an
-error.) It also means that the rest of the query can run a call with a
+its first result, and a query that reaches a limit returns the results it
+has (it can't be continued, see noContinuation in Glean.Query.UserQuery).
+It also means that the rest of the query can run a call with a
 demand that the evaluation still in progress has created, which is why
 evaluations are isolated (Note [Isolation]).
 -}

@@ -645,6 +645,43 @@ recursionTest = TestList
         assertEqual "4 is reachable from 1, 7 isn't"
           (map RTS.Nat [0, 1]) (sort answers)
 
+  , TestLabel "nested facts of results" $ TestCase $ do
+    -- runQ asks for results with their nested facts. Those are the Node
+    -- facts in the keys of the results: none of the auxiliary facts of
+    -- the evaluation leak out.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          predicate Node : nat
+          predicate Edge : { from: x.Node, to: x.Node }
+          predicate Path : { from: x.Node, to: x.Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": { "key": 1 }, "to": { "key": 2 } } }|]
+          , [s|{ "key": { "from": { "key": 2 }, "to": { "key": 3 } } }|]
+          , [s|{ "key": { "from": { "key": 3 }, "to": { "key": 4 } } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        response <- runQ env repo [s| x.Path { x.Node 1, _ } |]
+        facts <- decodeResultsAs "x.Path.1" schema response
+        assertEqual "results" 3 (length facts)
+        node <- either (assertFailure . unpack) (return . predicatePid) $
+          lookupPredicateSourceRef (parseRef "x.Node.1") LatestSchema schema
+        nested <- case response of
+          Right UserQueryResults
+            { userQueryResults_results = UserQueryEncodedResults_bin bin } ->
+            return (Map.elems (userQueryResultsBin_nestedFacts bin))
+          _ -> assertFailure "unexpected response"
+        assertEqual "nested facts are nodes"
+          (replicate 4 (fromIntegral (RTS.fromPid node)))
+          (map fact_type nested)
+
   , TestLabel "keeps values of any type across a recursive call" $
     TestCase $ do
     -- A and K are strings bound before the recursive call and used after

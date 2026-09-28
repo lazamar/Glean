@@ -143,6 +143,7 @@ The declarations follow these rules:
 * Their types refer to the schema's types and predicates by their qualified names, like `example.Class`.
 * Only on-demand derived predicates can be declared: they can't be `stored`, or have a `default` derivation.
 * They're checked like the schema's derived predicates: they're typechecked, and they can't depend on their own negation (see [Recursion](schema/recursion.md#no-recursion-through-negation)).
+* They're evaluated like the schema's derived predicates, so the advice in [Recursive predicates](angle/efficiency.md#recursive-predicates) applies to them too.
 
 A query can return facts of a predicate it declares. Clients have no schema for it, so they get the keys and values of the facts, as they would from a query that returns values rather than facts:
 

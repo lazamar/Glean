@@ -11,7 +11,7 @@ There are two important aspects of a query that affect its efficiency;
 1. Which fields are specified in a pattern
 2. The ordering of statements
 
-We’ll cover each of these in the following sections.
+We’ll cover each of these in the following sections. For recursive predicates, how the recursion is written matters too: see [Recursive predicates](#recursive-predicates).
 
 ## Efficient matching of facts
 
@@ -147,4 +147,61 @@ The query still works, and means exactly the same thing, but it’s much less ef
 This is going to involve searching all of the `example.Parent` facts, instead of just the ones for the parent of `Goldfish`.
 
 The general rule of thumb is to do the more specific searches first. The search for `example.Parent { child = { name = "Goldfish" }, parent = P }` is efficient because we know the `child`, this binds he value of `P` which makes the search for `example.Parent { child = P, parent = Q }` also fast.
+
+## Recursive predicates
+
+The same rules apply to [recursive predicates](../schema/recursion.md#recursive-derived-predicates), plus one more: the recursive call should know the same arguments as the query. There are two natural ways to write the ancestors of a class:
+
+```lang=angle
+# The recursive call comes first ("left-linear")
+predicate Ancestor : { child : Class, ancestor : Class }
+  { C, A } where
+    Parent { C, A } |
+    (Ancestor { C, P }; Parent { P, A })
+
+# The recursive call comes last ("right-linear")
+predicate AncestorR : { child : Class, ancestor : Class }
+  { C, A } where
+    Parent { C, A } |
+    (Parent { C, P }; AncestorR { P, A })
+```
+
+They mean the same thing, but for a query that knows the child, like `example.Ancestor { child = { name = "Goldfish" } }`, the first is much more efficient:
+
+* In `Ancestor`, the recursive call `Ancestor { C, P }` has the same child as the query. Glean finds the ancestors of `Goldfish` one generation at a time, and each step searches `Parent` by its first field. The work is proportional to the number of ancestors.
+* In `AncestorR`, the recursive call `AncestorR { P, A }` has a different child at each step: the parent of `Goldfish`, then its grandparent, and so on. Glean finds all the ancestors of each of them separately, so the work grows with the square of the number of ancestors.
+
+On a database indexing all of Stackage, finding the 1,031 modules that a module uses, directly or not, took 14 ms with the first shape and 226 ms with the second. The gap grows with the number of results.
+
+### Searching in the other direction
+
+For the descendants of a class, the query knows the `ancestor` instead, and neither definition is efficient:
+
+* In `Ancestor`, the recursive call `Ancestor { C, P }` knows nothing, so Glean derives the ancestors of every class before keeping the ones it needs.
+* In `AncestorR`, each step needs the children of a class, which means searching `Parent` by its second field: a search of all the `Parent` facts, at every step.
+
+The answer is the one from [the previous section](#making-queries-efficient-using-a-derived-predicate): the stored `Child` predicate, which has the fields in the other order, and a left-linear definition over it with the ancestor first:
+
+```lang=angle
+predicate Descendant : { ancestor : Class, descendant : Class }
+  { A, D } where
+    Child { A, D } |
+    (Descendant { A, P }; Child { P, D })
+```
+
+Now `example.Descendant { ancestor = { name = "Pet" } }` finds the descendants of `Pet` one generation at a time, and each step searches `Child` by its first field. On the Stackage database, finding the 21,616 modules that use a module, directly or not, took 56 s with the left-linear definition over the original relation, 1.6 s with the right-linear one, and 0.14 s with the left-linear definition over a stored copy with the fields swapped.
+
+### Summary
+
+To write an efficient recursive predicate:
+
+* Put the arguments that queries will know first.
+* Put the recursive call first ("left-linear"), so that it knows the same arguments as the query.
+* Make sure each step searches a stored predicate by a prefix of its key. For the other direction, that usually means a stored derived predicate with the fields swapped, like `Child`.
+* If queries need both directions, define a predicate for each.
+
+Some other things to know:
+
+* A query that only needs some of the results, such as a negation or the condition of an `if`, stops as soon as it has them.
+* Within one query, later calls with the same arguments reuse the results of a finished call. A right-linear definition also leaves behind the results of every intermediate call, which later calls can reuse. So in a query that calls it for many related values, the right-linear shape can occasionally come out ahead, even though each call on its own costs more. Measure before relying on it.
 * * *

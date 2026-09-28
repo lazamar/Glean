@@ -85,7 +85,7 @@ data Usage
 --
 -- BUMP THIS WHENEVER YOU CHANGE THE BYTECODE EVEN IF YOU JUST ADD INSTRUCTIONS
 version :: Int
-version = 15
+version = 16
 
 -- | Lowest bytecode version supported by the current engine.
 --
@@ -93,7 +93,7 @@ version = 15
 -- TO THE END OF THE LIST (in which case the new engine can still execute
 -- old bytecode)
 lowestSupportedVersion :: Int
-lowestSupportedVersion = 15
+lowestSupportedVersion = 16
 
 -- | Definitions of all bytecode instructions
 instructions :: [Insn]
@@ -405,5 +405,13 @@ instructions =
 
     -- Return from a subroutine.
   , Insn "Ret" [EndBlock, Return] [] []
+
+  , Insn "CallFun_4_1" [] []
+      [ Arg "fun" $ reg (Fun [Word,Word,Word,Word,WordPtr]) Load
+      , Arg "args" $ Regs [Word,Word,Word,Word,Word] ]
+
+  , Insn "CallFun_6_1" [] []
+      [ Arg "fun" $ reg (Fun [Word,Word,Word,Word,Word,Word,WordPtr]) Load
+      , Arg "args" $ Regs [Word,Word,Word,Word,Word,Word,Word] ]
 
   ]

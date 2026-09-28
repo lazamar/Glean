@@ -131,6 +131,48 @@ data QueryRegs = QueryRegs
     :: Register 'Word -- set token (invalid after this call)
     -> Code ()
 
+    -- | Create a store for the auxiliary facts of an evaluation of
+    -- recursive predicates. Its token is also a seek token: endSeek with it
+    -- (or an earlier token) frees it. See Note [Isolation] in
+    -- Glean.Query.Recursion.
+  , newStore
+    :: Register 'Word -- (output) store token
+    -> Code ()
+
+  , storeFirstFreeId
+    :: Register 'Word -- store
+    -> Register 'Word -- (output) first free id
+    -> Code ()
+
+    -- | Define a fact in a store
+  , storeNewFact
+    :: Register 'Word -- store
+    -> Register 'Word -- predicate id
+    -> Register 'BinaryOutputPtr -- clause
+    -> Register 'Word -- key size
+    -> Register 'Word -- (output) fact id
+    -> Code ()
+
+    -- | Start a traversal of the facts of a store in a range of ids
+  , storeSeekWithinSection
+    :: Register 'Word -- store
+    -> Register 'Word -- predicate id
+    -> Register 'DataPtr -- prefix
+    -> Register 'DataPtr -- prefix end
+    -> Register 'Word -- section start
+    -> Register 'Word -- section end
+    -> Register 'Word -- (output) token
+    -> Code ()
+
+    -- | Fact lookup in a store
+  , storeLookupKeyValue
+    :: Register 'Word -- store
+    -> Register 'Word -- fact id
+    -> Register 'BinaryOutputPtr
+    -> Register 'BinaryOutputPtr
+    -> Register 'Word -- (output) pid
+    -> Code ()
+
     -- | Unused, temporarily kept for backwards compatibility
   , saveState :: Register 'Word
 

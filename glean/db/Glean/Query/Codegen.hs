@@ -1643,6 +1643,8 @@ generateQueryCode f = generate Optimised $
     lookupKey_ result_ resultWithPid_ newDerivedFact_
     firstFreeId_ newSet_ insertOutputSet_ setToArray_ freeSet_
     newWordSet_ insertWordSet_ wordSetToArray_ byteSetToByteArray_ freeWordSet_
+    newStore_ storeFirstFreeId_ storeNewFact_ storeSeekWithinSection_
+    storeLookupKeyValue_
     saveState maxResults maxBytes ->
   let
     seek typ ptr end tok =
@@ -1713,6 +1715,27 @@ generateQueryCode f = generate Optimised $
 
     freeWordSet setToken =
       callFun_1_0 freeWordSet_ setToken
+
+    newStore tok = callFun_0_1 newStore_ tok
+
+    storeFirstFreeId store fid = callFun_1_1 storeFirstFreeId_ store fid
+
+    storeNewFact store ty clause size id =
+      callFun_4_1 storeNewFact_ store ty (castRegister clause) size id
+
+    storeSeekWithinSection store typ ptr end pfrom pto tok =
+      callFun_6_1 storeSeekWithinSection_
+        store
+        typ
+        (castRegister ptr)
+        (castRegister end)
+        pfrom
+        pto
+        tok
+
+    storeLookupKeyValue store id kout vout pid =
+      callFun_4_1 storeLookupKeyValue_
+        store id (castRegister kout) (castRegister vout) pid
 
     roundRange = Nothing
 

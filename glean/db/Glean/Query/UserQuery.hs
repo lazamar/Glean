@@ -663,7 +663,6 @@ userQueryImpl
         _ -> do
           (compileTime, _, (query@QueryWithInfo{..}, ty, preds)) <-
             timeIt $ compileAngleQuery
-              (envEnableRecursion env)
               schemaVersion
               schema
               mode
@@ -975,8 +974,7 @@ data CompilationMode
   | IncrementalDerivation (SeekSection -> Pid -> Bool)
 
 compileAngleQuery
-  :: EnableRecursion
-  -> SchemaSelector
+  :: SchemaSelector
     -- ^ Schema version to resolve unversioned predicates
   -> DbSchema
   -> CompilationMode
@@ -985,7 +983,7 @@ compileAngleQuery
   -> Bool
   -> DebugFlags
   -> IO (CodegenQuery, Type, [TcPred])
-compileAngleQuery rec ver dbSchema mode source stored debug = do
+compileAngleQuery ver dbSchema mode source stored debug = do
   parsed <- checkBadQuery Text.pack $ Angle.parseQuery source
   ifDebug $ "parsed query: " <> show (displayDefault parsed)
 
@@ -1002,7 +1000,7 @@ compileAngleQuery rec ver dbSchema mode source stored debug = do
   ifDebug $ "typechecked query: " <> show (displayDefault (qiQuery typechecked))
 
   flattened <- checkBadQuery id $ runExcept $
-    flatten rec dbSchema latestAngleVersion stored typechecked
+    flatten dbSchema latestAngleVersion stored typechecked
   ifDebug $ "flattened query: " <> show (displayDefault (qiQuery flattened))
 
   optimised <- checkBadQuery id $ runExcept $ optimise flattened

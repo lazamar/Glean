@@ -41,7 +41,6 @@ import Glean.Query.Vars
 import Glean.RTS.Types as RTS
 import Glean.RTS.Term as RTS
 import Glean.Database.Schema.Types
-import Glean.Database.Types (EnableRecursion(..))
 import qualified Glean.Angle.Types as Schema
 import Glean.Schema.Util
 
@@ -51,13 +50,12 @@ import Glean.Schema.Util
 -- Calls to recursive predicates become searches for their facts. See
 -- Note [Evaluating recursive predicates] in Glean.Query.Recursion.
 flatten
-  :: EnableRecursion
-  -> DbSchema
+  :: DbSchema
   -> Schema.AngleVersion
   -> Bool -- ^ derive DerivedAndStored predicates
   -> TypecheckedQuery
   -> Except Text FlattenedQuery
-flatten rec dbSchema ver deriveStored QueryWithInfo{..} =
+flatten dbSchema ver deriveStored QueryWithInfo{..} =
   fmap fst $ flip runStateT state $ do
     (flattened, maybeLookup, returnType) <- do
       flat <- flattenQuery qiQuery `catchError` flattenFailure
@@ -65,7 +63,7 @@ flatten rec dbSchema ver deriveStored QueryWithInfo{..} =
     nextVar <- gets flNextVar
     return $ QueryWithInfo flattened nextVar maybeLookup returnType
   where
-      state = initialFlattenState rec dbSchema qiNumVars deriveStoredPred
+      state = initialFlattenState dbSchema qiNumVars deriveStoredPred
 
       deriveStoredPred =
         case derefType qiReturnType of
@@ -295,22 +293,12 @@ flattenFactGen pidRef@(PidRef pid _) rng kpat vpat = do
         Schema.Derive when query
           | derive == Just predicateId -> expand query
           | Schema.DerivedAndStored <- when -> search
-          | HashMap.member predicateId (recursiveComponents dbSchema) -> do
-            refersToRecursive predicateId
+          -- A call to a recursive predicate is a search for its facts,
+          -- which are derived after reordering (see
+          -- Note [Evaluating recursive predicates] in Glean.Query.Recursion)
+          | HashMap.member predicateId (recursiveComponents dbSchema) ->
             search
           | otherwise -> expand query
-
--- | A call to a recursive predicate is a search for its facts, which are
--- derived after reordering (see Note [Evaluating recursive predicates]
--- in Glean.Query.Recursion).
-refersToRecursive :: Schema.PredicateId -> F ()
-refersToRecursive ref = do
-  recursion <- gets flRecursion
-  case recursion of
-    DisableRecursion ->
-      throwError $ "recursive reference to predicate " <>
-        Text.pack (show (displayDefault ref))
-    EnableRecursion -> return ()
 
 -- | The query returning the key and value of each fact of a recursive
 -- predicate that matches a demand, and the demand (see Note [Evaluating
@@ -355,7 +343,7 @@ flattenDerivation dbSchema ref demand bound =
         }
     return (query, d)
   where
-  state = initialFlattenState EnableRecursion dbSchema 0 (Just ref)
+  state = initialFlattenState dbSchema 0 (Just ref)
 
 -- | Patterns for the key of a predicate and for the key of a demand for
 -- it, where the bound fields of the key are variables bound by the

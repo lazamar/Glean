@@ -38,7 +38,6 @@ import Control.Exception
 import Control.Monad
 import Control.Monad.Except
 import Control.Monad.State as State
-import Data.Bifoldable (bifoldMap)
 import Data.ByteString (ByteString)
 import Data.Foldable
 import Data.Graph
@@ -47,7 +46,6 @@ import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
 import qualified Data.HashMap.Lazy as Lazy.HashMap
 import qualified Data.HashSet as HashSet
-import Data.HashSet (HashSet)
 import Data.List.Extra (firstJust, nubOrd, sort)
 import qualified Data.IntMap as IntMap
 import Data.IntMap (IntMap)
@@ -1024,10 +1022,10 @@ A dependency is negative when the predicate is searched inside a
 negation, in the condition of an if, or inside all (see
 tcQueryNegativeDeps).
 
-Unlike checkRecursiveDefinitions we include default derivations. Pairs of
-default derivations used for schema migration form cycles, but they don't
-negate each other, and if a default derivation ever were part of a cycle
-through negation it would be unsound whenever it is enabled.
+Default derivations are included. Pairs of default derivations used for
+schema migration form cycles, but they don't negate each other, and if a
+default derivation ever were part of a cycle through negation it would be
+unsound whenever it is enabled.
 -}
 
 -- | Check that no predicate depends negatively on itself, directly or
@@ -1230,11 +1228,6 @@ failOnLeft = \case
 -- when adding a new schema instance.
 validateNewSchemaInstance :: SchemaIndex -> IO ()
 validateNewSchemaInstance (SchemaIndex curr older) = failOnLeft $ do
-  -- Prevent recursive predicates. Because this is a constraint we will remove
-  -- in the future, for now we only check this when a new schema instance is to
-  -- be generated.
-  checkRecursiveDefinitions (schemasResolved $ procSchemaResolved curr)
-
   let auto = Map.mapMaybe listToMaybe $ predicatesByRef [curr]
 
   direct <- directEvolutions schemas
@@ -1271,64 +1264,6 @@ validateNewSchemaInstance (SchemaIndex curr older) = failOnLeft $ do
     | key <- HashMap.keys m
     , val <- close (`HashMap.lookup` m) key
     ]
-
--- | Detect recursion and co-recursion in predicate derivations.
--- We don't check default derived predicates because whether they will in fact
--- recurse or not depends on the db's content.
---
--- All schemas are checked together because a cycle can span schemas: a
--- @derive@ declaration can give a derivation to a predicate from another
--- schema.
-checkRecursiveDefinitions :: [ResolvedSchemaRef] -> Either Text ()
-checkRecursiveDefinitions schemas =
-  unless (null recursiveDefinitions) $
-  Left $ Text.unlines $
-    "found cycles in predicate derivations: " :
-    [ Text.intercalate " -> " $ map showRef (x:xs ++ [x])
-    | x:xs <- recursiveDefinitions
-    ]
-  where
-    recursiveDefinitions :: [[PredicateRef]]
-    recursiveDefinitions =
-      cycles (HashMap.keys deps) (\p -> HashMap.lookupDefault [] p deps)
-
-    -- derived predicate to derived predicate dependency map
-    deps :: HashMap PredicateRef [PredicateRef]
-    deps = fmap (filter hasDerivation .  preds) derivationQueries
-
-    hasDerivation :: PredicateRef -> Bool
-    hasDerivation ref = ref `HashMap.member` derivationQueries
-
-    derivationQueries :: HashMap PredicateRef (Query_ PredicateRef TypeRef)
-    derivationQueries = HashMap.mapMaybe
-      (toQuery . derivingDefDeriveInfo)
-      (HashMap.unions $ map resolvedSchemaDeriving schemas)
-      where
-        toQuery = \case
-          NoDeriving -> Nothing
-          Derive when query ->
-            case when of
-              DeriveIfEmpty -> Nothing
-              DeriveOnDemand -> Just query
-              DerivedAndStored -> Just query
-
-    -- predicates referenced in the query
-    preds :: Query_ PredicateRef TypeRef -> [PredicateRef]
-    preds query = HashSet.toList $ bifoldMap HashSet.singleton references query
-
-    cycles :: Ord a => [a] -> (a -> [a]) -> [[a]]
-    cycles roots children = [ cycle | CyclicSCC cycle <- scc]
-      where
-      scc = stronglyConnComp [ (node, node, children node) | node <- roots ]
-
-    types :: HashMap TypeRef ResolvedTypeDef
-    types = HashMap.unions $ map resolvedSchemaTypes schemas
-
-    -- predicates referenced by type
-    references :: TypeRef -> HashSet PredicateRef
-    references tref = fromMaybe mempty $ do
-      TypeDef _ ty _ <- HashMap.lookup tref types
-      return $ bifoldMap HashSet.singleton references ty
 
 definitions
   :: [ProcessedSchema]

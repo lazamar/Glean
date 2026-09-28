@@ -27,7 +27,6 @@ import Test.HUnit
 
 import System.Timeout
 import TestRunner
-import Util.Control.Exception (tryAll)
 import Util.EventBase
 import Util.String.Quasi
 import Thrift.Util (saveJSON)
@@ -188,11 +187,13 @@ schemaStoredError = TestCase $ do
           "stored predicate" `isInfixOf` err
         _ -> False
 
--- The validation run at gen-schema time.
+-- The validation run at gen-schema time. Recursive derivations are
+-- allowed; recursion through negation is rejected when the schema is
+-- loaded (see Note [Stratification] in Glean.Database.Schema).
 schemaGenValidation :: Test
 schemaGenValidation = TestList
   [ TestLabel "recursive derivation" $ TestCase $
-      hasCycles
+      accepted
         [s|
           schema test.1 {
             predicate P : nat
@@ -203,7 +204,7 @@ schemaGenValidation = TestList
         |]
 
   , TestLabel "co-recursive derivation" $ TestCase $ do
-      hasCycles
+      accepted
         [s|
           schema test.1 {
             predicate P : nat
@@ -219,7 +220,7 @@ schemaGenValidation = TestList
   , TestLabel "co-recursive derivation across schemas" $ TestCase $ do
       -- P gets its derivation from a derive declaration in a later
       -- schema, so neither schema contains the whole cycle.
-      hasCycles
+      accepted
         [s|
           schema test.1 {
             predicate P : nat
@@ -235,38 +236,9 @@ schemaGenValidation = TestList
           schema all.1 : test.2 {}
         |]
 
-  , TestLabel "default derivations are not cycles" $ TestCase $ do
-      -- The forwards/backwards compatibility pattern from the docs: P.1
-      -- and P.2 derive each other, but only one of the two derivations
-      -- is ever enabled, depending on which facts the DB contains.
-      void $ validate
-        [s|
-          version: 11
-          schema test.1 {
-            predicate P : { a : string, b : nat }
-          }
-          schema test.2 : test.1 {
-            predicate P : { a : string, b : nat, c : {} }
-
-            derive test.P.1 default
-              { A, B } where P.2 { A, B, _ }
-
-            derive test.P.2 default
-              { A, B, {} } where test.P.1 { A, B }
-          }
-
-          schema all.1 : test.1, test.2 {}
-        |]
   ]
   where
-    hasCycles schema = do
-      r <- tryAll $ validate schema
-      print r
-      case r of
-        Left err@SomeException{} ->
-          assertBool "validation failure" $
-          "found cycles in predicate derivations" `isInfixOf` show err
-        _ -> assertFailure "did not fail validation"
+    accepted = void . validate
 
     validate schema =
       withSystemTempDirectory "glean-dbtest" $ \root -> do

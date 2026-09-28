@@ -112,7 +112,7 @@ setParseTest = TestList
                 (typechecked, _) <-
                   typecheck undefined (defaultTcOpts def v) undefined resolved
                 liftEither $ runExcept $
-                  flatten DisableRecursion undefined v  False typechecked
+                  flatten undefined v  False typechecked
               case r of
                 Left err ->
                     assertFailure $

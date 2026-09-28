@@ -222,10 +222,17 @@ FactSet::seek(Pid type, folly::ByteRange start, size_t prefix_size) {
     // so iterators from earlier seeks remain valid. This matters for
     // recursive queries, which derive facts of a predicate while searching
     // for facts of the same predicate.
+    //
+    // The entry holds the first map.size() facts of the predicate in id
+    // order, so the missing facts are the ones after those. Recursive queries
+    // alternate between adding facts and seeking, so adding all the facts
+    // of the predicate every time would take quadratic time.
     if (!entry.withRLock([&](auto& map) { return map.size() == p->size(); })) {
       entry.withWLock([&](auto& map) {
         if (map.size() != p->size()) {
-          for (const Fact* fact : *p) {
+          const auto& ids = *idsOf(type);
+          for (auto i = map.size(); i < ids.size(); ++i) {
+            const Fact* fact = facts.get(distance(facts.startingId(), ids[i]));
             map.insert({fact->key(), fact});
           }
         }
@@ -335,6 +342,18 @@ std::unique_ptr<FactIterator> FactSet::factsWithin(Pid type, Id from, Id to) {
     const size_t end;
   };
 
+  const auto p = idsOf(type);
+  if (p == nullptr) {
+    return std::make_unique<EmptyIterator>();
+  }
+  const auto& ids = *p;
+  const auto begin = std::lower_bound(ids.begin(), ids.end(), from);
+  const auto end = std::lower_bound(begin, ids.end(), to);
+  return std::make_unique<Iterator>(
+      facts, ids, begin - ids.begin(), end - ids.begin());
+}
+
+const std::vector<Id>* FactSet::idsOf(Pid type) {
   auto wlock = id_index.value().data.wlock();
   for (auto i = wlock->upto; i < facts.size(); ++i) {
     const auto fact = facts[i];
@@ -343,14 +362,7 @@ std::unique_ptr<FactIterator> FactSet::factsWithin(Pid type, Id from, Id to) {
   wlock->upto = facts.size();
 
   const auto p = wlock->ids.find(type);
-  if (p == wlock->ids.end()) {
-    return std::make_unique<EmptyIterator>();
-  }
-  const auto& ids = p->second;
-  const auto begin = std::lower_bound(ids.begin(), ids.end(), from);
-  const auto end = std::lower_bound(begin, ids.end(), to);
-  return std::make_unique<Iterator>(
-      facts, ids, begin - ids.begin(), end - ids.begin());
+  return p == wlock->ids.end() ? nullptr : &p->second;
 }
 
 Id FactSet::define(Pid type, Fact::Clause clause, Id) {

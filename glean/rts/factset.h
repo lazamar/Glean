@@ -160,6 +160,11 @@ struct FactSet final : public Define {
       return facts[i]->ref();
     }
 
+    const Fact* get(size_t i) const {
+      assert(i < facts.size());
+      return facts[i].get();
+    }
+
     void clear() {
       facts.clear();
       fact_memory = 0;
@@ -359,6 +364,10 @@ struct FactSet final : public Define {
   /// lazily initialised and brought up to date with the facts added since.
   struct IdIndex;
   OnDemand<IdIndex> id_index;
+
+  /// The ids of the facts of a predicate, in increasing order, bringing the
+  /// id index up to date first. Null if there are none.
+  const std::vector<Id>* idsOf(Pid type);
 
   /// The facts of a predicate with ids in [from, to)
   std::unique_ptr<FactIterator> factsWithin(Pid type, Id from, Id to);

@@ -194,7 +194,6 @@ data Config = Config
     -- ^ Backup backends
   , cfgBatchLocationParser :: Some BatchLocation.Parser
     -- ^ Batch's location parser
-  , cfgEnableRecursion :: Bool
     -- ^ Enable experimental support for recursion
   , cfgFilterAvailableDBs :: [Repo] -> IO [Repo]
     -- ^ Filter out DBs not currently available on some other server
@@ -248,7 +247,6 @@ instance Default Config where
     , cfgDatabaseLogger = Some NullGleanDatabaseLogger
     , cfgBackupBackends = HashMap.fromList [("mock", Backup.Mock.mock)]
     , cfgBatchLocationParser = Some BatchLocation.DefaultParser
-    , cfgEnableRecursion = False
     , cfgFilterAvailableDBs = const $ return []
     , cfgAclGroupResolver = const (pure [])
     , cfgAclCalculateEnabled = aclCalculateEnabled
@@ -550,11 +548,6 @@ options = do
     pure def  -- default settings if no option given
   cfgReadOnly <- switch (long "db-read-only")
   cfgMockWrites <- switch (long "db-mock-writes")
-  cfgEnableRecursion <- switch
-    ( long "experimental-recursion"
-    <> help "Experimental support for recursive predicates. For testing only"
-    <> internal
-    )
   cfgDebug <- debugParser
   return Config
     { cfgListener = mempty

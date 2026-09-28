@@ -145,10 +145,6 @@ initEnv evb envStorage envDefaultStorage envCatalog shardManager cfg
       , envSchemaId = cfgSchemaId cfg
       , envShardManager = shardManager
       , envBackupBackends = cfgBackupBackends cfg
-      , envEnableRecursion =
-          if cfgEnableRecursion cfg
-          then EnableRecursion
-          else DisableRecursion
       , envFilterAvailableDBs = cfgFilterAvailableDBs cfg
       , envResolveAclGroups = cfgAclGroupResolver cfg
       , envAclCalculateEnabled = cfgAclCalculateEnabled cfg

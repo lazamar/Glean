@@ -12,7 +12,6 @@ module Glean.Database.Types (
   DB(..),
   Env(..), WriteQueues(..), WriteQueue(..), WriteJob(..),
   Derivation(..),
-  EnableRecursion(..),
   JanitorRunResult(..), JanitorException(..),
   DebugFlags(..),
 
@@ -221,10 +220,6 @@ instance NFData Derivation where
     `seq` derivationHandle
     `seq`()
 
-data EnableRecursion
-  = EnableRecursion
-  | DisableRecursion
-
 data JanitorRunResult
   = JanitorRunSuccess
   | JanitorRunFailure JanitorException
@@ -287,7 +282,6 @@ data Env = Env
       -- ^ Yield the current time. Is normally getCurrentTime but
       -- can be changed for testing
   , envShardManager :: SomeShardManager
-  , envEnableRecursion :: EnableRecursion
       -- ^ Experimental support for recursive queries. For testing only.
   , envFilterAvailableDBs :: [Thrift.Repo] -> IO [Thrift.Repo]
     -- ^ Filter out DBs not currently available in the server tier

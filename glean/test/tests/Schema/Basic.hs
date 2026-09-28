@@ -27,7 +27,6 @@ import Test.HUnit
 
 import System.Timeout
 import TestRunner
-import Util.Control.Exception (tryAll)
 import Util.EventBase
 import Util.String.Quasi
 import Thrift.Util (saveJSON)
@@ -188,11 +187,13 @@ schemaStoredError = TestCase $ do
           "stored predicate" `isInfixOf` err
         _ -> False
 
--- The validation run at gen-schema time.
+-- The validation run at gen-schema time. Recursive derivations are
+-- allowed, and recursion through negation is rejected when the schema is
+-- loaded (see Note [Stratification] in Glean.Database.Schema).
 schemaGenValidation :: Test
 schemaGenValidation = TestList
   [ TestLabel "recursive derivation" $ TestCase $
-      hasCycles
+      accepted
         [s|
           schema test.1 {
             predicate P : nat
@@ -203,7 +204,7 @@ schemaGenValidation = TestList
         |]
 
   , TestLabel "co-recursive derivation" $ TestCase $ do
-      hasCycles
+      accepted
         [s|
           schema test.1 {
             predicate P : nat
@@ -215,16 +216,10 @@ schemaGenValidation = TestList
 
           schema all.1 : test.1 {}
         |]
+
   ]
   where
-    hasCycles schema = do
-      r <- tryAll $ validate schema
-      print r
-      case r of
-        Left err@SomeException{} ->
-          assertBool "validation failure" $
-          "found cycles in predicate derivations" `isInfixOf` show err
-        _ -> assertFailure "did not fail validation"
+    accepted = void . validate
 
     validate schema =
       withSystemTempDirectory "glean-dbtest" $ \root -> do

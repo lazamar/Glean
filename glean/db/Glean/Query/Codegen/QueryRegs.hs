@@ -10,6 +10,8 @@ module Glean.Query.Codegen.QueryRegs
   ( QueryRegs(..)
   ) where
 
+import Data.IntSet (IntSet)
+
 import Glean.Bytecode.Types
 import Glean.RTS.Bytecode.Code
 
@@ -182,6 +184,11 @@ data QueryRegs = QueryRegs
     -- 'SeekOnRoundAll' both.
     -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
   , roundRange :: Maybe (Register 'Word, Register 'Word)
+
+    -- | When compiling the evaluation of a call to a recursive predicate,
+    -- the store that holds its auxiliary facts and the predicates whose
+    -- facts are in it. See Note [Isolation] in Glean.Query.Recursion.
+  , recStore :: Maybe (Register 'Word, IntSet)
 
     -- | Maximum number of results to return
   , maxResults :: Register 'Word

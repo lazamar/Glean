@@ -89,12 +89,15 @@ data CgStatement_ var
     , then_ :: [CgStatement_ var]
     , else_ :: [CgStatement_ var]
     }
-  | CgRec [CgStatement_ var] [CgDerivation]
+  | CgRec [CgStatement_ var] [CgDerivation] [PidRef]
     -- ^ Derive the facts of recursive predicates that have been
     -- demanded. The statements run first and create a demand. Then we run
     -- the queries in rounds, creating facts from their results, until a
     -- round creates no new facts. Each query has its own variables, and
-    -- none of them are visible to the statements that follow.
+    -- none of them are visible to the statements that follow. The given
+    -- predicates are the auxiliary predicates of the evaluation (demands,
+    -- suspensions and supplies), and their facts are kept in a store of
+    -- its own (see Note [Isolation] in Glean.Query.Recursion).
     -- See Note [Evaluating recursive predicates] and
     -- Note [Semi-naive evaluation] in Glean.Query.Recursion.
   deriving (Show, Functor, Foldable, Traversable)
@@ -361,7 +364,7 @@ instance Display CgStatement where
       , nest 2 $ sep ["then", doStmts then_]
       , nest 2 $ sep ["else", doStmts else_]
       ]
-    CgRec first queries -> hang 2 $ sep
+    CgRec first queries _ -> hang 2 $ sep
       [ "rec" <+> doStmts first
       , "("
       , sep $ punctuate ";"

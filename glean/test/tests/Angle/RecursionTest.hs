@@ -416,10 +416,11 @@ recursionTest = TestList
           (sort facts)
 
   , TestLabel "negated call followed by the same call" $ TestCase $ do
-    -- The negation stops as soon as it finds a path. If that could leave
-    -- the derivation for its demand unfinished, the second call, which
-    -- has the same demand, would find the demand already there, take it
-    -- as satisfied, and miss results. See Note [Semi-naive evaluation].
+    -- The negation stops as soon as it finds a path, leaving its
+    -- evaluation unfinished. If the second call, which has the same
+    -- demand, found the demand already there, it would take it as
+    -- evaluated and miss results. Evaluations are isolated, see
+    -- Note [Isolation] in Glean.Query.Recursion.
     withSchemaAndFacts [enableRecursion]
       [s|
         schema x.1 {
@@ -711,6 +712,69 @@ recursionTest = TestList
         searched <- factsSearched schema "x.Edge.1" response
         assertBool ("Edge facts searched: " <> show searched) $
           searched < 200
+
+  , TestLabel "a negated call stops at its first result" $ TestCase $ do
+    -- Results come out of an evaluation after each round, so the negation
+    -- can stop after the first round instead of deriving every path.
+    -- See Note [Streaming] in Glean.Query.Recursion.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> ... -> 100
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 99 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        response <- runQ env repo
+          [s| N where N = (1 | 100); !(x.Path { N, _ }) |]
+        nodes <- decodeNats response
+        assertEqual "nodes without paths" [RTS.Nat 100] nodes
+        searched <- factsSearched schema "x.Edge.1" response
+        assertBool ("Edge facts searched: " <> show searched) $
+          searched < 10
+
+  , TestLabel "calls inside the results of a call" $ TestCase $ do
+    -- The second call runs for each result of the first while the first is
+    -- still being evaluated, with a demand that the first evaluation has
+    -- created too (Path is right-recursive, so evaluating x.Path { 1, _ }
+    -- demands x.Path { 2, _ }, x.Path { 3, _ }, ...). It mustn't take that
+    -- demand as evaluated. See Note [Isolation] in Glean.Query.Recursion.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Edge { A, K }; x.Path { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4 -> 5
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 4 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        facts <- decodeResultsAs "x.Path.1" schema =<< runQ env repo
+          [s| P where x.Path { 1, Y }; P = x.Path { Y, _ } |]
+        assertEqual "paths from nodes reachable from 1"
+          [ RTS.Tuple [ RTS.Nat a, RTS.Nat b ]
+          | a <- [2 .. 5], b <- [a + 1 .. 5] ]
+          (sort facts)
   ]
 
 -- | How many facts of a predicate a query searched

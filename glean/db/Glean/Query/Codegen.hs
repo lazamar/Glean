@@ -147,7 +147,8 @@ findOutputs stmts = findOutputsStmts stmts IntSet.empty
   findOutputsStmt (CgConditional cond then_ else_) r =
      foldr (flip (foldr findOutputsStmt)) r [cond, then_, else_]
   -- the queries have their own variables
-  findOutputsStmt (CgRec first _ _) r = foldr findOutputsStmt r first
+  findOutputsStmt (CgRec first _ _ yield) r =
+    foldr findOutputsStmt r (first <> yield)
 
   findOutputsGen :: Generator -> IntSet -> IntSet
   findOutputsGen (FactGenerator _ kpat vpat _) r =
@@ -548,12 +549,14 @@ compileStatements
       -- Create a store for the auxiliary facts of the evaluation (see
       -- Note [Isolation] in Glean.Query.Recursion) and run the first
       -- statements, then run the queries in rounds until a round derives no
-      -- new facts. Facts are never removed, and new facts get increasing
-      -- ids, so the auxiliary facts derived in a round are the ones in the
-      -- store with ids from its first free id at the start of the round to
-      -- its first free id at the end.
+      -- new facts. After each round, run the rest of the query for each
+      -- fact the round derived for the call (Note [Streaming]). Facts are
+      -- never removed, and new facts get increasing ids, so the auxiliary
+      -- facts derived in a round are the ones in the store with ids from
+      -- its first free id at the start of the round to its first free id
+      -- at the end.
       -- See Note [Semi-naive evaluation] in Glean.Query.Recursion.
-      compile (CgRec first queries auxiliary : rest) =
+      compile (CgRec first queries auxiliary yield : rest) =
         local $ \store roundStart roundEnd -> do
         newStore store
         let
@@ -571,12 +574,18 @@ compileStatements
           -- the facts derived since roundStart are new in this round
           let thisRound = recRegs { roundRange = Just (roundStart, roundEnd) }
           forM_ queries $ compileDerivation thisRound qtrans bounds
+          -- the facts derived in this round
+          a <- local $ \derived -> do
+            storeFirstFreeId store derived
+            let produced = recRegs { roundRange = Just (roundEnd, derived) }
+            compileStatements syscalls qtrans bounds produced yield vars $
+              compile rest
           move roundEnd roundStart
           jump loop
           done <- label
           -- free the store
           endSeek store
-          compile rest
+          return a
 
       -- an empty list of generators should fall through without
       -- executing inner, but we have to compile inner because we need

@@ -10,7 +10,10 @@
 module Angle.RecursionTest (main) where
 
 import Control.Exception
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_)
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KeyMap
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Default (def)
@@ -26,7 +29,8 @@ import Test.HUnit
 import TestRunner
 import Util.String.Quasi
 
-import Glean.Angle.Types (AngleVersion(..), Type_(NatTy), latestAngleVersion)
+import Glean.Angle.Types
+  (AngleVersion(..), FieldDef_(..), Type_(NatTy, RecordTy), latestAngleVersion)
 import Glean.Database.Schema.Types
 import Glean.Database.Types (Env)
 import Glean.Init
@@ -1055,17 +1059,106 @@ localTest = TestList
       |]
     assertBadQuery "recursion through negation" r
 
-  , TestLabel "can't return their facts" $ TestCase $
+  , TestLabel "returning their facts" $ TestCase $
     withGraph $ \env repo _ -> do
-    forM_
-      [ [s| Reach { 1, _ } |]
-      , [s| { R, X } where R = Reach { 1, X } |]
-      ] $ \query -> do
-      r <- runQ env repo $ query <> [s|
-        predicate Reach : { from: nat, to: nat }
-          { A, B } where x.Edge { A, B } | (Reach { A, K }; x.Edge { K, B })
+    -- as facts of the temporary predicate, so binary works
+    facts <- either assertFailure return =<<
+      decodeResults
+        (RecordTy [FieldDef "from" NatTy, FieldDef "to" NatTy])
+        userQueryResultsBin_facts
+      =<< runQ env repo ([s| Reach { 1, _ } |] <> reach)
+    assertEqual "paths from 1"
+      [ RTS.Tuple [RTS.Nat 1, RTS.Nat n] | n <- [2, 3, 4] ]
+      (sort facts)
+
+  , TestLabel "keys and values of their facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    (facts, _) <- runJSON env repo True
+      [s|
+        Next _
+        predicate Next : nat -> nat
+          A -> B where x.Edge { A, B }
       |]
-      assertBadQuery "can't return facts of the predicates it declares" r
+    assertEqual "keys and values"
+      [ Just (1, 2), Just (2, 3), Just (3, 4), Just (10, 11) ]
+      (sort
+        [ (,) <$> (nat =<< field ["key"] fact)
+            <*> (nat =<< field ["value"] fact)
+        | fact <- facts ])
+
+  , TestLabel "nested facts, expanded" $ TestCase $
+    withGraph $ \env repo _ -> do
+    (facts, nested) <- runJSON env repo True
+      ([s| { R, X } where R = Reach { 1, X } |] <> reach)
+    assertEqual "no separate nested facts" 0 (Map.size nested)
+    assertEqual "facts in the results"
+      [ Just (1, n) | n <- [2, 3, 4] ]
+      (sort
+        [ do
+            (from, to) <- reachKey =<< field ["key", "tuplefield0"] fact
+            x <- nat =<< field ["key", "tuplefield1"] fact
+            if to == x then Just (from, to) else Nothing
+        | fact <- facts ])
+
+  , TestLabel "nested facts, not expanded" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- they're returned even though the query doesn't ask for nested facts
+    (facts, nested) <- runJSON env repo False
+      ([s| { R, X } where R = Reach { 1, X } |] <> reach)
+    paths <- forM facts $ \fact -> do
+      ref <- maybe (assertFailure "no reference") return $
+        nat =<< field ["key", "tuplefield0", "id"] fact
+      nestedFact <- maybe (assertFailure "not a nested fact") return $
+        Map.lookup (fromIntegral ref) nested
+      return (reachKey nestedFact)
+    assertEqual "facts in the results"
+      [ Just (1, n) | n <- [2, 3, 4] ] (sort paths)
+
+  , TestLabel "nested facts of nested facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- a declared predicate whose key has facts of another
+    (facts, _) <- runJSON env repo True
+      [s|
+        Hop _
+        predicate Hop : { first: Step, second: Step }
+          { S1, S2 } where S1 = Step { _, B }; S2 = Step { B, _ }
+        predicate Step : { from: nat, to: nat }
+          { A, B } where x.Edge { A, B }
+      |]
+    assertEqual "hops"
+      [ Just ((1, 2), (2, 3)), Just ((2, 3), (3, 4)) ]
+      (sort
+        [ (,) <$> (reachKey =<< field ["key", "first"] fact)
+            <*> (reachKey =<< field ["key", "second"] fact)
+        | fact <- facts ])
+
+  , TestLabel "nested facts in a binary encoding" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- the client couldn't decode them
+    r <- runQ env repo ([s| { R, X } where R = Reach { 1, X } |] <> reach)
+    assertBadQuery "only the JSON encoding can return" r
+
+  , TestLabel "returning their facts up to a limit" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- resuming the query fails before compiling the continuation's type,
+    -- which refers to Reach
+    let
+      options = def
+        { userQueryOptions_syntax = QuerySyntax_ANGLE
+        , userQueryOptions_max_results = Just 1
+        }
+      query = def
+        { userQuery_query = [s| Reach _ |] <> reach
+        , userQuery_options = Just options
+        , userQuery_encodings = [ UserQueryEncoding_bin def ]
+        }
+    UserQueryResults{..} <- userQuery env repo query
+    cont <- maybe (assertFailure "no continuation") return
+      userQueryResults_continuation
+    r <- try $ userQuery env repo query
+      { userQuery_options = Just options
+          { userQueryOptions_continuation = Just cont } }
+    assertBadQuery "can't be continued" r
 
   , TestLabel "results up to a limit, without continuing" $ TestCase $
     withGraph $ \env repo _ -> do
@@ -1119,6 +1212,18 @@ localTest = TestList
     assertBadQuery "can't store derived facts" r
   ]
   where
+  reach =
+    [s|
+      predicate Reach : { from: nat, to: nat }
+        { A, B } where x.Edge { A, B } | (Reach { A, K }; x.Edge { K, B })
+    |]
+
+  -- the key of a Reach fact in JSON
+  reachKey :: Aeson.Value -> Maybe (Int, Int)
+  reachKey fact = (,)
+    <$> (nat =<< field ["key", "from"] fact)
+    <*> (nat =<< field ["key", "to"] fact)
+
   -- 1 -> 2 -> 3 -> 4, 10 -> 11
   withGraph :: (Env -> Repo -> DbSchema -> IO ()) -> IO ()
   withGraph = withSchemaAndFacts []
@@ -1139,6 +1244,38 @@ localTest = TestList
         , [s|{ "key": { "from": 10, "to": 11 } }|]
         ]
     ]
+
+-- | Run a query with the JSON encoding, returning its results and nested
+-- facts.
+runJSON
+  :: Env
+  -> Repo
+  -> Bool -- ^ expand nested facts in the results
+  -> ByteString
+  -> IO ([Aeson.Value], Map.Map Int64 Aeson.Value)
+runJSON env repo expand query = do
+  UserQueryResults{..} <- userQuery env repo $ def
+    { userQuery_query = query
+    , userQuery_options = Just def
+      { userQueryOptions_syntax = QuerySyntax_ANGLE
+      , userQueryOptions_expand_results = expand
+      , userQueryOptions_recursive = False
+      }
+    }
+  let decode = either assertFailure return . Aeson.eitherDecodeStrict
+  facts <- mapM decode userQueryResults_facts
+  nested <- traverse decode userQueryResults_nestedFacts
+  return (facts, nested)
+
+-- | A field of a JSON object, following a path of field names
+field :: [Text] -> Aeson.Value -> Maybe Aeson.Value
+field [] v = Just v
+field (f : fs) (Aeson.Object o) = field fs =<< KeyMap.lookup (Key.fromText f) o
+field _ _ = Nothing
+
+nat :: Aeson.Value -> Maybe Int
+nat (Aeson.Number n) = Just (truncate n)
+nat _ = Nothing
 
 assertBadQuery :: String -> Either BadQuery a -> IO ()
 assertBadQuery expected r = case r of

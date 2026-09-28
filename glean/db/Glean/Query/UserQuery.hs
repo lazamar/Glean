@@ -175,6 +175,10 @@ data Results stats fact = Results
     -- | Additional facts satisfying nested parts of the query
   , resNestedFacts :: IntMap fact
 
+    -- | The predicates declared by the query, by Pid, which nested facts
+    -- can belong to. See Note [Query-local predicates].
+  , resLocalPredicates :: IntMap PredicateDetails
+
     -- | Continuation for paging
   , resCont :: Maybe Thrift.UserQueryCont
 
@@ -212,6 +216,12 @@ class Encoding e where
   type EncodedFact e
 
   shouldExpand :: e -> Bool
+
+  -- | Whether the encoding can have facts of the predicates declared by
+  -- the query. Clients decode the other encodings with their own schema,
+  -- which doesn't have them. See Note [Query-local predicates].
+  encodesLocalFacts :: e -> Bool
+
   serializeFact
     :: e
     -> IntMap (EncodedFact e)
@@ -258,6 +268,8 @@ instance Encoding LegacyJSONEncoding where
   shouldExpand (LegacyJSONEncoding opts) =
     Thrift.userQueryOptions_expand_results opts
 
+  encodesLocalFacts _ = True
+
   serializeFact
     (LegacyJSONEncoding opts)
     serialized
@@ -282,6 +294,8 @@ instance Encoding Thrift.UserQueryEncodingJSON where
   type EncodedFact Thrift.UserQueryEncodingJSON = ByteString
 
   shouldExpand = Thrift.userQueryEncodingJSON_expand_results
+
+  encodesLocalFacts _ = True
 
   serializeFact enc serialized fid predicateDetails Thrift.Fact{..} =
     factToJSON
@@ -308,6 +322,8 @@ instance Encoding Thrift.UserQueryEncodingCompact where
 
   shouldExpand = Thrift.userQueryEncodingCompact_expand_results
 
+  encodesLocalFacts _ = False
+
   serializeFact _ serialized fid predicateDetails Thrift.Fact{..} =
     factToCompact
       serialized
@@ -332,6 +348,8 @@ instance Encoding Thrift.UserQueryEncodingBin where
 
   shouldExpand _ = False
 
+  encodesLocalFacts _ = False
+
   serializeFact _ _ _ _ = return
 
   setResults enc res qres = qres
@@ -354,6 +372,8 @@ instance Encoding Thrift.UserQueryEncodingListBin where
   type EncodedFact Thrift.UserQueryEncodingListBin = Thrift.Fact
 
   shouldExpand _ = False
+
+  encodesLocalFacts _ = False
 
   serializeFact _ _ _ _ = return
 
@@ -385,11 +405,21 @@ performUserQuery encoding schema query = do
   !results <- withStats $ do
     res <- query
 
+    let
+      factDetails ty =
+        case IntMap.lookup (fromIntegral ty) (resLocalPredicates res) of
+          Nothing -> pidDetails schema ty
+          Just details
+            | encodesLocalFacts encoding -> return details
+            | otherwise -> throwIO $ Thrift.BadQuery $
+              "the results have facts of predicates declared by the " <>
+              "query, which only the JSON encoding can return"
+
     -- Convert nested facts - we do it in the order of their fact ids
     -- which means we can only depend on facts converted earlier.
     nested <- foldM
       (\expanded (fid, fact@Thrift.Fact{..}) -> do
-          details <- pidDetails schema fact_type
+          details <- factDetails fact_type
           encoded <- serializeFact
             encoding
             (if shouldExpand encoding then expanded else IntMap.empty)
@@ -482,6 +512,7 @@ userQueryFactsImpl
         { resFacts = Vector.toList queryResultsFacts
         , resPredicate = Nothing
         , resNestedFacts = mkNestedFacts queryResultsNestedFacts
+        , resLocalPredicates = IntMap.empty
         , resCont = Nothing
         , resStats = stats
         , resDiags = []
@@ -655,6 +686,11 @@ userQueryImpl
     (returnType,compileTime,diag,cont,querySchema) <-
       case Thrift.userQueryOptions_continuation opts of
         Just ucont
+          -- An empty continuation can't be resumed (see runQuery). We check
+          -- this before compiling its type, which can refer to predicates
+          -- declared by the query.
+          | B.null (Thrift.userQueryCont_continuation ucont) ->
+            throwIO $ Thrift.BadQuery noContinuation
           | Just retTy <- Thrift.userQueryCont_returnType ucont -> do
           (compileTime, _, returnType) <-
             timeIt $ compileType schema schemaVersion retTy
@@ -686,7 +722,7 @@ userQueryImpl
               Nothing -> Left query
           return (ty,compileTime,irDiag <> predDiag,cont,querySchema)
 
-    details <- getReturnPredicateDetails schema returnType
+    details <- getReturnPredicateDetails querySchema returnType
 
     if Thrift.userQueryOptions_just_check opts then do
       return $ emptyResult {resDiags = diag}
@@ -745,7 +781,15 @@ getReturnPredicateDetails schema@DbSchema{..} returnType = do
     Angle.PredicateTy _ (PidRef pid _) ->
       case IntMap.lookup (fromIntegral (fromPid pid)) predicatesByPid of
         Nothing -> throwIO $ Thrift.Exception "internal: no predicate"
-        Just d -> return d
+        Just d
+          -- We return facts of a predicate declared by the query as facts
+          -- of the temporary predicate. See Flatten.captureKey and
+          -- Note [Query-local predicates]
+          | pid `Set.member` schemaLocalPids -> return d
+            { predicatePid = tempPid schema
+            , predicateId = tempPredicateId
+            }
+          | otherwise -> return d
 
     _not_a_predicate -> do
       return
@@ -809,7 +853,23 @@ runQuery
       checkPredicatesMatch schema details ref schemaVersion
 
     expandPids <- optsExpandPids opts schemaVersion schema
-    let limits = mkQueryRuntimeOptions opts config expandPids
+    let
+      localPredicates = IntMap.fromList
+        [ (fromIntegral (fromPid pid), d)
+        | pid <- Set.toList (schemaLocalPids querySchema)
+        , Just d <- [lookupPid pid querySchema] ]
+
+      -- Facts of predicates declared by the query are always included in
+      -- the nested facts, because their ids mean nothing outside the
+      -- query. See Note [Query-local predicates]
+      nestedLocal = not $ Set.null $
+        localPidsIn querySchema (predicateKeyType details) <>
+        localPidsIn querySchema (predicateValueType details)
+
+      limits = mkQueryRuntimeOptions opts config $
+        if nestedLocal
+          then expandPids <> schemaLocalPids querySchema
+          else expandPids
 
     nextId <- case Thrift.userQueryOptions_continuation opts of
       Just Thrift.UserQueryCont{..}
@@ -826,7 +886,11 @@ runQuery
         else return Nothing
 
     appliedTrans <- either (throwIO . Thrift.BadQuery) return $
-      transformationsFor schema trans returnType
+      transformationsFor schema trans $
+        -- including the types that facts of declared predicates refer to
+        Angle.RecordTy $ map (Angle.FieldDef "") $ returnType : concat
+          [ [predicateKeyType d, predicateValueType d]
+          | d <- IntMap.elems localPredicates ]
 
     ( qResults@QueryResults{..}
       , queryDiag
@@ -836,7 +900,6 @@ runQuery
       case cont of
         Right ucont -> do
           let binaryCont = Thrift.userQueryCont_continuation ucont
-          when (B.null binaryCont) $ throwIO $ Thrift.BadQuery noContinuation
           results <- transformResultsBack appliedTrans <$>
             restartCompiled
               (schemaInventory schema)
@@ -860,8 +923,8 @@ runQuery
             (\(_, _, sub) -> release $ compiledQuerySub sub)
             $ \(codegenTime, _, sub) -> do
               results <- transformResultsBack appliedTrans <$>
-                executeCompiled (schemaInventory schema) defineOwners stack
-                  sub limits
+                executeCompiled (schemaInventory querySchema) defineOwners
+                  stack sub limits
 
               diags <-
                 evaluate $ force (bytecodeDiag sub) -- don't keep sub alive
@@ -914,6 +977,7 @@ runQuery
           { resFacts = Vector.toList queryResultsFacts
           , resPredicate = Just details
           , resNestedFacts = mkNestedFacts queryResultsNestedFacts
+          , resLocalPredicates = localPredicates
           , resCont = userCont
           , resStats = stats
           , resDiags = compileDiag ++ queryDiag ++
@@ -1020,10 +1084,6 @@ compileAngleQuery ver schema mode source stored debug = do
     typecheck dbSchema tcOpts (dbSchemaRtsType dbSchema) resolved
   ifDebug $ "typechecked query: " <> show (displayDefault (qiQuery typechecked))
 
-  let returned = localPidsIn dbSchema (qiReturnType typechecked)
-  unless (Set.null returned) $ throwIO $ Thrift.BadQuery $
-    "a query can't return facts of the predicates it declares yet"
-
   flattened <- checkBadQuery id $ runExcept $
     flatten dbSchema latestAngleVersion stored typechecked
   ifDebug $ "flattened query: " <> show (displayDefault (qiQuery flattened))
@@ -1092,6 +1152,21 @@ closure of a relation, in a single query.
   that they're like any other derived predicate, so flattening,
   recursion and code generation need nothing new. Queries that don't
   declare predicates use the DB's schema as before.
+
+* Results. Clients have no schema for the declared predicates, and the
+  ids of their facts mean nothing outside the query, but their facts can
+  still be returned:
+  - A query whose result is a declared predicate returns its facts as
+    facts of the temporary predicate, with their keys and values. That's
+    how a query returns any value that isn't a fact of the schema
+    (Flatten.captureKey, getReturnPredicateDetails).
+  - Facts of declared predicates nested in the results are returned like
+    the schema's. The query's schema has the code to traverse them
+    (schemaInventory), and the JSON encoding uses their types. They're
+    always included in the nested facts, even if the query doesn't ask
+    for nested facts, since the client couldn't look them up later.
+  - Other encodings can't have them, because clients decode those with
+    their own schema. A query whose results have them fails.
 
 * Continuations. A query that declares predicates can't be continued,
   just like a query that evaluates recursive predicates. When it reaches
@@ -1172,6 +1247,7 @@ emptyResult = Results {
     resFacts = mempty
   , resPredicate = Nothing
   , resNestedFacts = mempty
+  , resLocalPredicates = IntMap.empty
   , resCont = Nothing
   , resStats = Stats {
       statFactCount = 0

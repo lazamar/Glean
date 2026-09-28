@@ -19,6 +19,7 @@ import Data.List hiding (intersect)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Maybe
+import qualified Data.Set as Set
 import Data.Text (Text)
 import qualified Data.Text as Text
 
@@ -743,7 +744,15 @@ captureKey ver dbSchema
           (conc ords, capturedOrd)
         _other -> (ord, [])
 
-    returnTy = tupleSchema [ty, predicateKeyType, predicateValueType]
+    -- Facts of a predicate declared by the query are returned as facts
+    -- of the temporary predicate. See Note [Query-local predicates] in
+    -- Glean.Query.UserQuery.
+    factTy
+      | pid `Set.member` schemaLocalPids dbSchema =
+        Angle.PredicateTy () (PidRef (tempPid dbSchema) tempPredicateId)
+      | otherwise = ty
+
+    returnTy = tupleSchema [factTy, predicateKeyType, predicateValueType]
 
   case catMaybes capturedOrd of
     [(key, val)] ->

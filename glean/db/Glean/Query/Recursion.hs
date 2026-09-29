@@ -122,6 +122,16 @@ suspended derivation (Note [Suspension]) look them up and match them
 against the call's pattern, which can be more specific than the binding
 pattern.
 
+We find them by going through the round's new Supply facts and keeping
+those for the call's demand, rather than by searching for the Supply
+facts of the demand in the round. A search with a key prefix in a range
+of ids goes through every fact with that prefix and skips those outside
+the range (FactSet::seekWithinSection), so each round would go through
+every fact derived for the call so far, which is quadratic in the number
+of rounds. Going through the round's new Supply facts uses the index of
+facts by id, and over the whole evaluation goes through each Supply fact
+once.
+
 Streaming lets a query stop an evaluation early, e.g. a negation stops at
 its first result, and a query that reaches a limit returns the results it
 has (it can't be continued, see noContinuation in Glean.Query.UserQuery).
@@ -411,18 +421,25 @@ call inside search = do
             IntMap.findWithDefault [] (componentIndex component) . exAuxiliary
           supply <- lift $ supplyPredicate this
           fact <- freshVar (Angle.PredicateTy () (pidRef details))
+          suppliedFor <- freshVar (Angle.PredicateTy () demand)
           let
-            -- the facts derived for the call in the round (Note [Streaming])
-            supplied = CgStatement
-              (Ref (MatchWild (Angle.PredicateTy () supply)))
-              (FactGenerator supply
-                (Tuple [Ref (MatchVar fid), Ref (MatchBind fact)])
-                (Tuple [])
-                SeekOnRoundNew)
+            -- the facts derived for the call in the round: the round's new
+            -- Supply facts, then those for the call's demand. Not a search
+            -- for the demand's Supply facts, see Note [Streaming].
+            supplied =
+              [ CgStatement
+                  (Ref (MatchWild (Angle.PredicateTy () supply)))
+                  (FactGenerator supply
+                    (Tuple [Ref (MatchBind suppliedFor), Ref (MatchBind fact)])
+                    (Tuple [])
+                    SeekOnRoundNew)
+              , CgStatement (Ref (MatchVar suppliedFor))
+                  (TermGenerator (Ref (MatchVar fid)))
+              ]
           return
             [ ifCompleted
                 [ CgRec [create] derivations auxiliary
-                    (supplied : found search fact) complete ]
+                    (supplied <> found search fact) complete ]
             ]
 
 -- | The statements marking every demand of a call in an evaluation's

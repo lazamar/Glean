@@ -95,17 +95,17 @@ data CgStatement_ var
       [PidRef]
       [CgStatement_ var]
       [[CgStatement_ var]]
-    -- ^ Evaluate a call to a recursive predicate. The first statements
-    -- run first and create the call's demand. Then we run the queries in
-    -- rounds, creating facts from their results, until a round creates no
-    -- new facts. After each round, the last statements produce the facts
+    -- ^ Evaluate a call to a recursive predicate (the design's rec). The
+    -- first statements run first and create the call's demand. Then we
+    -- run the queries in rounds, each to completion, until a round
+    -- creates no new facts. After each round, the last statements produce the facts
     -- the round derived for the call, and the statements that follow the
-    -- CgRec run for each of them. Each query has its own variables, and
-    -- none of them are visible to the statements that follow. The given
-    -- predicates are the auxiliary predicates of the evaluation (demands,
-    -- suspensions and supplies), and their facts are kept in a store of
-    -- its own. Once the rounds are over, the last lists of
-    -- statements run to completion and mark the evaluation's demands as
+    -- CgRec run for each of them. Each query has its own variables,
+    -- and none of them are visible to the statements that follow. The
+    -- facts of the given predicates, the auxiliary predicates of the
+    -- evaluation (demands, suspensions and supplies), are kept in a store
+    -- of its own. When the rounds are over, each of the last lists of
+    -- statements runs to completion, marking the evaluation's demands as
     -- completed. See Note [Streaming], Note [Isolation] and
     -- Note [Caching] in Glean.Query.Recursion.
     -- See Note [Evaluating recursive predicates] and
@@ -115,14 +115,14 @@ data CgStatement_ var
 
 type CgStatement = CgStatement_ Var
 
--- | A query deriving facts of a recursive predicate for its demands. It
--- returns the key and value of each fact and the demand it is for. For
--- each result we create the fact and a Supply fact recording that it was
--- derived for the demand. See Note [Suspension] in Glean.Query.Recursion.
+-- | A query that a CgRec runs to completion in each round, for the facts
+-- it creates: facts of the recursive predicates and auxiliary facts. See
+-- Note [Suspension] in Glean.Query.Recursion.
 data CgDerivation = CgDerivation
-  { derivedPredicate :: PidRef
-  , derivedSupply :: PidRef
-  , derivedQuery :: CodegenQuery
+  { derivationStmts :: [CgStatement]
+  , derivationNumVars :: Int
+    -- ^ its variables are its own, separate from those of the query
+    -- around the CgRec
   }
   deriving Show
 
@@ -377,9 +377,7 @@ instance Display CgStatement where
     CgRec first queries _ yield complete -> hang 2 $ sep
       [ "rec" <+> doStmts first
       , "("
-      , sep $ punctuate ";"
-          [ hang 2 $ sep [display opts pid <+> "<-", display opts (qiQuery q)]
-          | CgDerivation pid _ q <- queries ]
+      , sep $ punctuate ";" [ doStmts stmts | CgDerivation stmts _ <- queries ]
       , ")"
       , "yield" <+> doStmts yield
       , "complete" <+> sep (map doStmts complete)

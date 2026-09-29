@@ -1486,37 +1486,16 @@ withTerm vars term action = do
     buildTerm reg vars term
     action reg
 
--- | Run a query deriving facts of a recursive predicate (see CgDerivation)
--- to completion. For each result we create the fact, and a Supply fact
--- recording the demand it was derived for.
+-- | Run a query of a recursive evaluation (see CgDerivation) to completion.
+-- It's run for the facts it creates, so it has no results.
 compileDerivation
   :: QueryRegs
   -> QueryTransformations
   -> Boundaries
   -> CgDerivation
   -> Code ()
-compileDerivation regs qtrans bounds (CgDerivation pidRef supply query) =
-  case qiQuery query of
-    CgQuery (Tuple [key, val, demand]) body -> derive key val demand body
-    _ -> error "compileDerivation: unexpected query"
-  where
-  derive key val demand body = do
-    let
-      numVars0 = qiNumVars query
-      -- Create the facts with statements at the end, which run for each
-      -- result of the query.
-      -- (a DerivedFactGenerator whose result isn't bound creates nothing)
-      fid = Var (Angle.PredicateTy () pidRef) numVars0 Nothing
-      supplied = Var (Angle.PredicateTy () supply) (numVars0 + 1) Nothing
-      numVars = numVars0 + 2
-      stmts = body ++
-        [ CgStatement (Ref (MatchBind fid))
-            (DerivedFactGenerator pidRef key val)
-        , CgStatement (Ref (MatchBind supplied))
-            (DerivedFactGenerator supply
-              (Tuple [demand, Ref (MatchVar fid)]) (Tuple []))
-        ]
-      outputVars = IntSet.toList $ findOutputs stmts
+compileDerivation regs qtrans bounds (CgDerivation stmts numVars) = do
+    let outputVars = IntSet.toList $ findOutputs stmts
     outputUninitialized $ Many (length outputVars) $ \outputRegs ->
       local $ Many (numVars - length outputVars) $ \localRegs -> do
       let

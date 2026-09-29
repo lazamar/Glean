@@ -90,11 +90,12 @@ we generate
    stratification puts it in a lower component (see Note [Stratification]
    in Glean.Database.Schema).
 
-   We create the facts from the results of the queries rather than with
-   a statement inside them. Such a statement could be reordered before a
-   filter and create facts that aren't true (see Note [Writing derived
-   facts] in Glean.Query.UserQuery), and we would then derive more facts
-   from them.
+   The facts are created by statements that we add at the end of the
+   queries once they have been reordered, rather than by statements of
+   the derivation, because the reorderer could put such a statement
+   before a filter and create facts that aren't true (see
+   Note [Writing derived facts] in Glean.Query.UserQuery). Those facts
+   would then be used to derive more.
 
 3. After each round, we match the facts derived for the call in that
    round against the call's pattern, and run the rest of the query for
@@ -660,13 +661,36 @@ derivationsFor this@(ref, binding) = do
       ownCalls <- gets exOwnCalls
       modify $ \s -> s { exRequired = fst outer, exOwnCalls = snd outer }
       queries <- suspend this demand expanded ownCalls
-      let
-        result =
-          ( [ CgDerivation (pidRef details) supply q | q <- queries ]
-          , required )
+      derivations <- liftEither $ mapM (creating (pidRef details) supply) queries
+      let result = (derivations, required)
       modify $ \s ->
         s { exDerivations = Map.insert this result (exDerivations s) }
       return result
+
+-- | A query of an evaluation, from a query deriving facts of P for its
+-- demands: for each result, create the fact of P, and a Supply fact
+-- recording the demand it was derived for. The statements creating them
+-- go after the reordered statements of the query, so they can't be
+-- reordered before a filter (Note [Evaluating recursive predicates]).
+creating :: PidRef -> PidRef -> CodegenQuery -> Either Text CgDerivation
+creating predicate supply QueryWithInfo{..} = case qiQuery of
+  CgQuery (Tuple [key, val, demand]) stmts ->
+    let
+      -- a DerivedFactGenerator whose result isn't bound creates nothing
+      fact = Var (Angle.PredicateTy () predicate) qiNumVars Nothing
+      supplied = Var (Angle.PredicateTy () supply) (qiNumVars + 1) Nothing
+    in
+    Right CgDerivation
+      { derivationStmts = stmts <>
+          [ CgStatement (Ref (MatchBind fact))
+              (DerivedFactGenerator predicate key val)
+          , CgStatement (Ref (MatchBind supplied))
+              (DerivedFactGenerator supply
+                (Tuple [demand, Ref (MatchVar fact)]) (Tuple []))
+          ]
+      , derivationNumVars = qiNumVars + 2
+      }
+  _ -> Left "internal error: creating: unexpected query"
 
 -- | A call to the component being derived. It holds the variable of the
 -- demand fact it creates, the search for its facts, and what runs after

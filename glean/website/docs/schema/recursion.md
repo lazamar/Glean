@@ -73,6 +73,9 @@ facts> A where example.Ancestor { child = { name = "Goldfish" }, ancestor = A }
 * Within a query, once a call to a recursive predicate has finished,
   later calls with the same arguments reuse its results.
 
+A query can also declare its own recursive predicates, without changing
+the schema: see [Predicates declared in a query](../derived.md#predicates-declared-in-a-query).
+
 ### No recursion through negation
 
 A derived predicate can't depend on its own negation, directly or

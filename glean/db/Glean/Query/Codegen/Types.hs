@@ -103,8 +103,7 @@ data CgStatement_ var
     -- CgRec run for each of them. Each query has its own variables,
     -- and none of them are visible to the statements that follow. The
     -- facts of the given predicates, the auxiliary predicates of the
-    -- evaluation (demands, suspensions and supplies), are kept in a store
-    -- of its own. When the rounds are over, each of the last lists of
+    -- evaluation (its Event predicates), are kept in a store of its own. When the rounds are over, each of the last lists of
     -- statements runs to completion, marking the evaluation's demands as
     -- completed. See Note [Streaming], Note [Isolation] and
     -- Note [Caching] in Glean.Query.Recursion.

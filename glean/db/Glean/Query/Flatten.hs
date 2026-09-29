@@ -306,7 +306,7 @@ flattenFactGen pidRef@(PidRef pid _) rng kpat vpat = do
 -- recursive predicates] in Glean.Query.Recursion):
 --
 -- > { Key, Value, D } where
--- >   D = Demand { X.. };
+-- >   D = Event_P (0|{ X.. });    -- a demand for P
 -- >   <derivation of P, with the bound fields of its key set to X..>
 --
 -- Also returns D, which is bound before the query runs (see
@@ -314,7 +314,7 @@ flattenFactGen pidRef@(PidRef pid _) rng kpat vpat = do
 flattenDerivation
   :: DbSchema
   -> Schema.PredicateId
-  -> PidRef -- ^ the Demand predicate
+  -> PidRef -- ^ the Event predicate, whose first alternative is demands
   -> [Bool] -- ^ which fields of the key the demand binds
   -> Except Text (FlattenedQuery, Var)
 flattenDerivation dbSchema ref demand bound =
@@ -333,7 +333,7 @@ flattenDerivation dbSchema ref demand bound =
     nextVar <- gets flNextVar
     let
       demandStmt = FlatStatement demandTy (Ref (MatchBind d))
-        (FactGenerator demand demandPat (Tuple []) SeekOnAllFacts)
+        (FactGenerator demand (Alt 0 demandPat) (Tuple []) SeekOnAllFacts)
       query = QueryWithInfo
         { qiQuery = FlatQuery (Tuple [key, val, Ref (MatchVar d)]) Nothing $
             mkStatementGroup (Floating demandStmt : flattenStmts stmts)

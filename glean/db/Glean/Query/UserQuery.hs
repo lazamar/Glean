@@ -970,7 +970,7 @@ runQuery
           displayDefault returnType
 
         -- leave out predicates that only exist while the query runs, like
-        -- the Demand predicates of recursive queries
+        -- the Event predicates of recursive queries
         knownPid pid _ = isJust (lookupPid (Pid pid) schema)
 
         results = Results
@@ -1390,7 +1390,7 @@ getStats schema fullScans QueryResults{..} = do
       Vector.length queryResultsNestedFacts
 
     -- leave out predicates that only exist while the query runs, like the
-    -- Demand predicates of recursive queries
+    -- Event predicates of recursive queries
     pref pid = predicateIdRef . predicateId <$> lookupPid pid schema
 
   addStatValueType "glean.query.facts" facts Stats.Sum

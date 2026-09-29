@@ -696,6 +696,16 @@ compileStatements
           fail <- label
           return a
 
+        -- <pat> = X where X holds a binary value: match the pattern
+        -- against the value where it is, rather than copying it first
+        (pat, TermGenerator (Ref (MatchVar (Var ty v _))))
+          | not (isWordTy ty), not (isEmptyTy ty) -> mdo
+          cmpOutputPat syscalls (castRegister (vars ! v))
+            (preProcessPat (inlineVars vars pat)) fail
+          a <- continue
+          fail <- label
+          return a
+
         -- ToDO: push the pat into compileGen and match it eagerly, save
         -- some copying.
         (pat, gen) ->

@@ -93,6 +93,8 @@ expandGenerators hasFacts stmts =
       error "unexpected negation in stored derived predicate"
     CgConditional{} ->
       error "unexpected if statement in stored derived predicate"
+    CgRec{} ->
+      error "unexpected recursion in stored derived predicate"
 
   known (Ref MatchFid{}) = True
   known (Ref MatchVar{}) = True

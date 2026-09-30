@@ -288,6 +288,14 @@ struct Eval {
     (*a.fun)(context, frame, a.args, a.args_arity);
   }
 
+  FOLLY_ALWAYS_INLINE void execute(CallFun_4_1 a) {
+    (*a.fun)(context, frame, a.args, a.args_arity);
+  }
+
+  FOLLY_ALWAYS_INLINE void execute(CallFun_6_1 a) {
+    (*a.fun)(context, frame, a.args, a.args_arity);
+  }
+
   FOLLY_ALWAYS_INLINE void execute(Select a) {
     if (a.sel < a.tgts_size) {
       pc += std::ptrdiff_t(a.tgts[a.sel]);

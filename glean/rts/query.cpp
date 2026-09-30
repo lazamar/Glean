@@ -49,6 +49,11 @@ struct QueryExecutor : SetOps {
     Id id;
     size_t prefix_size;
     bool first;
+    // Non-null for an entry that holds a store rather than an iterator,
+    // see newStore().
+    std::unique_ptr<FactSet> store;
+    // Whether the iterator is over the facts of a store
+    bool inStore = false;
   };
 
   QueryExecutor(
@@ -133,6 +138,47 @@ struct QueryExecutor : SetOps {
   // Define a new derived fact, and return its fact ID.
   //
   Id newDerivedFact(Pid type, binary::Output* clause, size_t keySize);
+
+  //
+  // Stores hold the auxiliary facts of an evaluation of recursive
+  // predicates (demands, suspensions and supplies), separately from the
+  // facts of the query, so that different evaluations don't see each
+  // other's facts. A store lives on the iterator stack. newStore() pushes
+  // it and returns its token, which identifies the store, and endSeek()
+  // with that token or an earlier one frees it. That includes when the
+  // query leaves the evaluation early. Store fact ids only mean something
+  // within their store.
+  //
+  IterToken newStore();
+
+  Id storeFirstFreeId(IterToken store);
+
+  Id storeNewFact(
+      IterToken store,
+      Pid type,
+      binary::Output* clause,
+      size_t keySize);
+
+  IterToken storeSeekWithinSection(
+      IterToken store,
+      Pid type,
+      const unsigned char* key_begin,
+      const unsigned char* key_end,
+      Id from,
+      Id upto);
+
+  Pid storeLookupKeyValue(
+      IterToken store,
+      Id fid,
+      binary::Output* kout,
+      binary::Output* vout);
+
+  FactSet& getStore(IterToken store) {
+    if (store >= iters.size() || !iters[store].store) {
+      error("invalid store: {}", store);
+    }
+    return *iters[store].store;
+  }
 
   //
   // Record a nested fact that we visited during traversal, see
@@ -391,7 +437,7 @@ Id QueryExecutor::newDerivedFact(
 
     // The Ids can only be facts that we already have computed owners for.
     for (const auto& iter : iters) {
-      if (iter.id != Id::invalid()) {
+      if (iter.id != Id::invalid() && !iter.inStore) {
         auto owner = facts.getOwner(iter.id);
         if (owner == INVALID_USET) {
           VLOG(1) << "fact " << iter.id.toWord() << " has no owner";
@@ -408,8 +454,92 @@ Id QueryExecutor::newDerivedFact(
   return id;
 };
 
+uint64_t QueryExecutor::newStore() {
+  auto token = iters.size();
+  DVLOG(5) << "newStore() = " << token;
+  QueryExecutor::Iter entry;
+  entry.type = Pid::invalid();
+  entry.id = Id::invalid();
+  entry.prefix_size = 0;
+  entry.first = false;
+  entry.store = std::make_unique<FactSet>(Id::lowest());
+  iters.emplace_back(std::move(entry));
+  return static_cast<uint64_t>(token);
+}
+
+Id QueryExecutor::storeFirstFreeId(uint64_t store) {
+  return getStore(store).firstFreeId();
+}
+
+Id QueryExecutor::storeNewFact(
+    uint64_t store,
+    Pid type,
+    binary::Output* key,
+    size_t keySize) {
+  Fact::Clause clause = Fact::Clause::from(key->bytes(), keySize);
+  auto id = getStore(store).define(type, clause);
+  if (id == Id::invalid()) {
+    error(
+        "recursive query produced auxiliary facts of {} with identical keys "
+        "but different values",
+        type.toWord());
+  }
+  return id;
+}
+
+uint64_t QueryExecutor::storeSeekWithinSection(
+    uint64_t store,
+    Pid type,
+    const unsigned char* key_begin,
+    const unsigned char* key_end,
+    Id from,
+    Id upto) {
+  const folly::ByteRange key(key_begin, key_end);
+  // the FactSet itself doesn't move when iters grows
+  auto& facts = getStore(store);
+  auto token = iters.size();
+  DVLOG(5) << "storeSeekWithinSection(" << store << ", " << type.toWord()
+           << ") = " << token;
+  QueryExecutor::Iter entry;
+  entry.iter = facts.seekWithinSection(type, key, from, upto, std::nullopt);
+  entry.type = type;
+  entry.id = Id::invalid();
+  entry.prefix_size = key.size();
+  entry.first = true;
+  entry.inStore = true;
+  iters.emplace_back(std::move(entry));
+  return static_cast<uint64_t>(token);
+}
+
+Pid QueryExecutor::storeLookupKeyValue(
+    uint64_t store,
+    Id fid,
+    binary::Output* kout,
+    binary::Output* vout) {
+  DVLOG(5) << "storeLookupKeyValue(" << store << ", " << fid.toWord() << ")";
+  Pid factPid = Pid::invalid();
+  getStore(store).factById(fid, [&](Pid pid_, auto clause) {
+    factPid = pid_;
+    if (kout) {
+      *kout = binary::Output();
+      kout->put(clause.key());
+    }
+    if (vout) {
+      *vout = binary::Output();
+      vout->put(clause.value());
+    }
+  });
+  return factPid;
+}
+
 void put(binary::Output& out, const QueryExecutor::Iter& iter) {
-  if (auto fact = iter.iter->get(FactIterator::KeyOnly)) {
+  // A store, or an iterator over one, can't be resumed, so we serialize it
+  // as a finished iterator. Queries that evaluate recursive predicates
+  // don't support continuations anyway.
+  if (!iter.iter || iter.inStore) {
+    serialize::put(out, Id::invalid().toWord());
+    serialize::put(out, Pid::invalid().toWord());
+  } else if (auto fact = iter.iter->get(FactIterator::KeyOnly)) {
     serialize::put(out, fact.id);
     serialize::put(out, iter.type);
     serialize::put(out, static_cast<uint64_t>(iter.prefix_size));
@@ -617,7 +747,12 @@ std::unique_ptr<QueryResults> executeQuery(
       &QueryExecutor::insertWordSet,
       &QueryExecutor::wordSetToArray,
       &QueryExecutor::byteSetToByteArray,
-      &QueryExecutor::freeWordSet>(q);
+      &QueryExecutor::freeWordSet,
+      &QueryExecutor::newStore,
+      &QueryExecutor::storeFirstFreeId,
+      &QueryExecutor::storeNewFact,
+      &QueryExecutor::storeSeekWithinSection,
+      &QueryExecutor::storeLookupKeyValue>(q);
 
   folly::Optional<SerializedCont> cont;
   Subroutine::Activation::with(

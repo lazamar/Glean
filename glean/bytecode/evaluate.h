@@ -241,8 +241,14 @@
         case Op::Ret:
           return eval_Ret();
   
-        case Op::Unused60:
-        case Op::Unused61:
+        case Op::CallFun_4_1:
+          eval_CallFun_4_1();
+          break;
+  
+        case Op::CallFun_6_1:
+          eval_CallFun_6_1();
+          break;
+  
         case Op::Unused62:
         case Op::Unused63:
         case Op::Unused64:
@@ -504,6 +510,8 @@
       &&label_TraceReg,
       &&label_Suspend,
       &&label_Ret,
+      &&label_CallFun_4_1,
+      &&label_CallFun_6_1,
     };
   
     goto *labels[*pc++];
@@ -745,6 +753,14 @@
   
   label_Ret:
           return eval_Ret();
+  
+  label_CallFun_4_1:
+          eval_CallFun_4_1();
+    goto *labels[*pc++];
+  
+  label_CallFun_6_1:
+          eval_CallFun_6_1();
+    goto *labels[*pc++];
   }
 
   struct InputNat {
@@ -1583,5 +1599,35 @@
   FOLLY_ALWAYS_INLINE const uint64_t * FOLLY_NULLABLE  eval_Ret() {
     Ret args;
     DVLOG(5) << "Ret";
+    return execute(args);
+  }
+
+  struct CallFun_4_1 {
+    SysFun fun;
+    static constexpr uint64_t args_arity = 5;
+    const uint64_t *args;
+  };
+  
+  FOLLY_ALWAYS_INLINE void eval_CallFun_4_1() {
+    CallFun_4_1 args;
+    args.fun = Reg<SysFun>(&frame[*pc++]).get();
+    args.args = pc;
+    pc += args.args_arity;
+    DVLOG(5) << "CallFun_4_1" << "  " << "<<funptr>>" << "  " << "<<reg arguments>>";
+    return execute(args);
+  }
+
+  struct CallFun_6_1 {
+    SysFun fun;
+    static constexpr uint64_t args_arity = 7;
+    const uint64_t *args;
+  };
+  
+  FOLLY_ALWAYS_INLINE void eval_CallFun_6_1() {
+    CallFun_6_1 args;
+    args.fun = Reg<SysFun>(&frame[*pc++]).get();
+    args.args = pc;
+    pc += args.args_arity;
+    DVLOG(5) << "CallFun_6_1" << "  " << "<<funptr>>" << "  " << "<<reg arguments>>";
     return execute(args);
   }

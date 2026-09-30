@@ -20,7 +20,9 @@ userQuerySysCalls =
   ,"newDerivedFact", "firstFreeId"
   ,"newSet", "insertOutputSet", "setToArray", "freeSet"
   ,"newWordSet", "insertWordSet", "wordSetToArray", "byteSetToArray"
-  ,"freeWordSet"]
+  ,"freeWordSet"
+  ,"newStore", "storeFirstFreeId", "storeNewFact", "storeSeekWithinSection"
+  ,"storeLookupKeyValue"]
 
 -- This list has to sync up with the list in Glean.RTS.Typecheck or
 -- the wrong name will be printed

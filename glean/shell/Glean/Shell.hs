@@ -1011,16 +1011,25 @@ runUserQuery sQuery = do
      ]
      ++
      [ vcat $ "Facts searched:" :
-         [ pretty (printf "%40s : %d%s" (show (pretty ref)) count
+         [ pretty (printf "%40s : %d%s" name count
              (if ref `elem` scans then " (full scan)" else "" :: String)
                :: String)
          | (pid, count) <- sortOn (Down . snd) $ Map.toList m
-         , Just info <- [schemaInfo]
-         , Just ref <- [Map.lookup pid (Thrift.schemaInfo_predicateIds info)] ]
+         , Just (ref, name) <- [predicateName schemaInfo stats pid] ]
      | stats == FullStats
      , Just stats <- [finalStats]
      , Just m <- [Thrift.userQueryStats_facts_searched stats]
      , let scans = Thrift.userQueryStats_full_scans stats
+     ]
+     ++
+     [ vcat $ "Facts derived:" :
+         [ pretty (printf "%40s : %d" name count :: String)
+         | (pid, count) <- sortOn (Down . snd) $ Map.toList m
+         , Just (_, name) <- [predicateName schemaInfo stats pid] ]
+     | stats == FullStats
+     , Just stats <- [finalStats]
+     , Just m <- [Thrift.userQueryStats_facts_derived stats]
+     , not (Map.null m)
      ]
      ++
      [ vcat $ if Thrift.userQueryStats_result_count stats < fromIntegral limit
@@ -1039,6 +1048,18 @@ runUserQuery sQuery = do
      | isJust (Thrift.userQueryResults_continuation finalResults)
      , Just stats <- [finalStats]
      ]
+
+  -- The predicate with an Id in the query's stats, and its name. The
+  -- predicates the query declares aren't in the schema, so we show them
+  -- by the name they have in the query.
+  predicateName info stats pid
+    | Just ref <- Map.lookup pid
+        =<< Thrift.userQueryStats_declared_predicates stats
+    = Just (ref, Text.unpack (Thrift.predicateRef_name ref))
+    | Just i <- info
+    , Just ref <- Map.lookup pid (Thrift.schemaInfo_predicateIds i)
+    = Just (ref, show (pretty ref))
+    | otherwise = Nothing
 
 -- | A line from the user (or entry on the command line) may end in a backslash
 -- and be a 'Cont' continued line, otherwise it is a 'Whole' line, see 'endBS'

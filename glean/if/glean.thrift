@@ -712,7 +712,8 @@ struct UserQueryStats {
   // bytes allocated by the server
   5: optional map<Id, i64> facts_searched;
   // number of facts of each predicate searched. Use getSchemaInfo
-  // to map Id to PredicateRef.
+  // to map Id to PredicateRef, and declared_predicates for the
+  // predicates declared by the query.
   6: optional i64 compile_time_ns;
   // time to compile the query
   7: optional i64 bytecode_size;
@@ -727,6 +728,13 @@ struct UserQueryStats {
   // whether the query performs full predicate scans
   12: optional i64 result_bytes;
   // query results size in bytes
+  13: optional map<Id, PredicateRef> declared_predicates;
+  // the predicates declared by the query. getSchemaInfo doesn't know
+  // them, since they only exist while the query runs
+  14: optional map<Id, i64> facts_derived;
+  // number of facts of each derived predicate that the query derived,
+  // when collect_facts_searched is set. Ids map to PredicateRefs as
+  // in facts_searched.
 }
 
 # Results in Glean's internal binary representation

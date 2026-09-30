@@ -194,6 +194,9 @@ data Results stats fact = Results
     -- | Count of the facts searched per Pid
   , resFactsSearched :: Maybe (Map Int64 Int64)
 
+    -- | Count of the facts derived per Pid
+  , resFactsDerived :: Maybe (Map Int64 Int64)
+
     -- | Inferred type of the query, for logging
   , resType :: Maybe Text
 
@@ -518,6 +521,7 @@ userQueryFactsImpl
         , resDiags = []
         , resWriteHandle = Nothing
         , resFactsSearched = Nothing
+        , resFactsDerived = Nothing
         , resType = Nothing  -- could be facts of different predicates
         , resBytecodeSize = Nothing
         , resCompileTime = Nothing
@@ -932,6 +936,21 @@ runQuery
               let fullScans = compiledQueryFullScans sub
               return (results, diags, sz, codegenTime, fullScans)
 
+    -- The query derives facts of recursive predicates, and of stored
+    -- predicates when it stores derived facts. We leave out the results,
+    -- which are facts of the temporary predicate, and the facts of the
+    -- auxiliary predicates of recursive queries. Neither is in the
+    -- query's schema.
+    factsDerived <- if Thrift.userQueryOptions_collect_facts_searched opts
+      then do
+        counts <- FactSet.predicateStats derived
+        return $ Just $ Map.fromList
+          [ (fromIntegral (fromPid pid), count)
+          | (pid, Thrift.PredicateStats{predicateStats_count = count}) <- counts
+          , isJust (lookupPid pid querySchema)
+          , count > 0 ]
+      else return Nothing
+
     -- If we're storing derived facts, queue them for writing and
     -- return the handle. We allow querying for stored derived
     -- predicates with stored=True on a read-only DB; this is used
@@ -961,7 +980,7 @@ runQuery
         let bs' = if incomplete then B.empty else bs
         return $ Just $ mkUserQueryCont (Right returnType) bs' nextId
 
-    stats <- getStats schema fullScans qResults
+    stats <- getStats querySchema fullScans qResults
 
     when (isJust userCont) $
       addStatValueType "glean.query.truncated" 1 Stats.Sum
@@ -969,9 +988,10 @@ runQuery
     let ppType = renderStrict $ layoutPretty defaultLayoutOptions $
           displayDefault returnType
 
-        -- leave out predicates that only exist while the query runs, like
-        -- the Demand predicates of recursive queries
-        knownPid pid _ = isJust (lookupPid (Pid pid) schema)
+        -- leave out the auxiliary predicates of recursive queries, like
+        -- Demand, but keep the predicates the query declares. Clients get
+        -- their names from declared_predicates in the stats
+        knownPid pid _ = isJust (lookupPid (Pid pid) querySchema)
 
         results = Results
           { resFacts = Vector.toList queryResultsFacts
@@ -984,6 +1004,7 @@ runQuery
               [ noContinuation | incomplete ]
           , resWriteHandle = maybeWriteHandle
           , resFactsSearched = Map.filterWithKey knownPid <$> queryResultsStats
+          , resFactsDerived = factsDerived
           , resType = Just ppType
           , resBytecodeSize = Just bytecodeSize
           , resCompileTime = Just compileTime
@@ -1257,6 +1278,7 @@ emptyResult = Results {
   , resDiags = []
   , resWriteHandle = Nothing
   , resFactsSearched = Nothing
+  , resFactsDerived = Nothing
   , resType = Nothing
   , resBytecodeSize = Nothing
   , resCompileTime = Nothing
@@ -1389,8 +1411,8 @@ getStats schema fullScans QueryResults{..} = do
       Vector.length queryResultsFacts +
       Vector.length queryResultsNestedFacts
 
-    -- leave out predicates that only exist while the query runs, like the
-    -- Demand predicates of recursive queries
+    -- leave out the auxiliary predicates of recursive queries, like Demand,
+    -- which aren't in the schema
     pref pid = predicateIdRef . predicateId <$> lookupPid pid schema
 
   addStatValueType "glean.query.facts" facts Stats.Sum
@@ -1412,6 +1434,7 @@ withStats io = do
         , Thrift.userQueryStats_elapsed_ns = truncate (secs * 1000000000)
         , Thrift.userQueryStats_allocated_bytes = fromIntegral bytes
         , Thrift.userQueryStats_facts_searched = resFactsSearched res
+        , Thrift.userQueryStats_facts_derived = resFactsDerived res
         , Thrift.userQueryStats_bytecode_size =
             fromIntegral <$> resBytecodeSize res
         , Thrift.userQueryStats_compile_time_ns =
@@ -1423,6 +1446,12 @@ withStats io = do
         , Thrift.userQueryStats_full_scans = statFullScans $ resStats res
         , Thrift.userQueryStats_result_bytes =
             fromIntegral <$> resResultBytes res
+        , Thrift.userQueryStats_declared_predicates =
+            if IntMap.null (resLocalPredicates res)
+              then Nothing
+              else Just $ Map.fromList
+                [ (fromIntegral pid, predicateIdRef (predicateId details))
+                | (pid, details) <- IntMap.toList (resLocalPredicates res) ]
         }
   return res{ resStats = stats }
 

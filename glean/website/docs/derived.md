@@ -111,6 +111,59 @@ predicate DeclarationWithName :
 
 Using this predicate requires no magic on the part of the client, they just query for the `cxx1.DeclarationWithName` predicate in exactly the same way as they would for other predicates, and the Glean query server returns the appropriate facts.
 
+## Predicates declared in a query
+
+A query can declare derived predicates of its own, after the query itself. They're written like a schema's [on-demand derived predicates](#on-demand-derived-predicates), and only exist while the query runs. This lets a query compute something that the schema has no predicate for, without changing the schema.
+
+For example, using the schema from the [Angle Guide](angle/guide.md), this query finds every class that `Goldfish` inherits from, directly or not. `Ancestor` is [recursive](schema/recursion.md#recursive-derived-predicates): an ancestor is a parent, or a parent of an ancestor.
+
+```lang=angle
+A where Ancestor { child = { name = "Goldfish" }, ancestor = A }
+
+predicate Ancestor : { child : example.Class, ancestor : example.Class }
+  { C, A } where
+    example.Parent { C, A } |
+    (Ancestor { C, P }; example.Parent { P, A })
+```
+
+In the shell, end each line but the last with a backslash to write a query over several lines:
+
+```
+facts> A where Ancestor { child = { name = "Goldfish" }, ancestor = A } \
+facts| predicate Ancestor : { child : example.Class, ancestor : example.Class } \
+facts|   { C, A } where example.Parent { C, A } | (Ancestor { C, P }; example.Parent { P, A })
+{ "id": 1026, "key": { "name": "Fish", "line": 30 } }
+{ "id": 1024, "key": { "name": "Pet", "line": 10 } }
+```
+
+The declarations follow these rules:
+
+* A declared predicate has a plain name that starts with an uppercase letter, like `Ancestor`, and the name refers to it everywhere in the query. The schema's predicates always have qualified names, like `example.Parent`, so a declared predicate can't hide one.
+* Declared predicates can refer to themselves and to each other, whatever order they're declared in. They can also use the schema's predicates, including derived and recursive ones.
+* Their types refer to the schema's types and predicates by their qualified names, like `example.Class`.
+* Only on-demand derived predicates can be declared: they can't be `stored`, or have a `default` derivation.
+* They're checked like the schema's derived predicates: they're typechecked, and they can't depend on their own negation (see [Recursion](schema/recursion.md#no-recursion-through-negation)).
+* They're evaluated like the schema's derived predicates, so the advice in [Recursive predicates](angle/efficiency.md#recursive-predicates) applies to them too.
+
+A query can return facts of a predicate it declares. Clients have no schema for it, so they get the keys and values of the facts, as they would from a query that returns values rather than facts:
+
+```
+facts> Ancestor { child = { name = "Goldfish" } } \
+facts| predicate Ancestor : { child : example.Class, ancestor : example.Class } \
+facts|   { C, A } where example.Parent { C, A } | (Ancestor { C, P }; example.Parent { P, A })
+{ "id": 1040, "key": { "child": { "id": 1027, "key": { "name": "Goldfish", "line": 40 } }, "ancestor": { "id": 1026, "key": { "name": "Fish", "line": 30 } } } }
+{ "id": 1041, "key": { "child": { "id": 1027, "key": { "name": "Goldfish", "line": 40 } }, "ancestor": { "id": 1024, "key": { "name": "Pet", "line": 10 } } } }
+```
+
+There are some caveats:
+
+* **Facts of declared predicates only exist while the query runs.** Their ids mean nothing afterwards, so a client can't look them up later.
+* **Facts of declared predicates nested in the results are always included**, like the facts of `Ancestor` in `{ R, A } where R = Ancestor { _, A }`, even when the query doesn't ask for nested facts. Facts of the schema's predicates are only included if the query asks for them, as usual.
+* **Only the JSON encoding can return nested facts of declared predicates.** Clients decode the binary and compact encodings with their own schema, which doesn't have the declared predicates, so a query whose results have such facts fails in those encodings. Facts of a declared predicate returned as the query's results, as above, work in any encoding.
+* **The query can't be continued.** When it reaches one of its limits (on the number of results, bytes or time), it returns the results it has found so far, with a diagnostic saying that there may be more. Resuming it fails: in the shell, `:more` does. Raise the limit to get more results.
+* **It can't store derived facts**, e.g. with `*` in the shell.
+* **Error messages show a declared predicate with version 0**, like `Ancestor.0`.
+
 ## Derived predicates for schema migration
 
 One important use case for derived predicates is to make it possible to change the schema without breaking things.

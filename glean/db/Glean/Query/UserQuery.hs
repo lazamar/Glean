@@ -194,6 +194,9 @@ data Results stats fact = Results
     -- | Count of the facts searched per Pid
   , resFactsSearched :: Maybe (Map Int64 Int64)
 
+    -- | Count of the facts derived per Pid
+  , resFactsDerived :: Maybe (Map Int64 Int64)
+
     -- | Inferred type of the query, for logging
   , resType :: Maybe Text
 
@@ -518,6 +521,7 @@ userQueryFactsImpl
         , resDiags = []
         , resWriteHandle = Nothing
         , resFactsSearched = Nothing
+        , resFactsDerived = Nothing
         , resType = Nothing  -- could be facts of different predicates
         , resBytecodeSize = Nothing
         , resCompileTime = Nothing
@@ -932,6 +936,21 @@ runQuery
               let fullScans = compiledQueryFullScans sub
               return (results, diags, sz, codegenTime, fullScans)
 
+    -- The query derives facts of recursive predicates, and of stored
+    -- predicates when it stores derived facts. We leave out the results,
+    -- which are facts of the temporary predicate, and the facts of the
+    -- auxiliary predicates of recursive queries. Neither is in the
+    -- query's schema.
+    factsDerived <- if Thrift.userQueryOptions_collect_facts_searched opts
+      then do
+        counts <- FactSet.predicateStats derived
+        return $ Just $ Map.fromList
+          [ (fromIntegral (fromPid pid), count)
+          | (pid, Thrift.PredicateStats{predicateStats_count = count}) <- counts
+          , isJust (lookupPid pid querySchema)
+          , count > 0 ]
+      else return Nothing
+
     -- If we're storing derived facts, queue them for writing and
     -- return the handle. We allow querying for stored derived
     -- predicates with stored=True on a read-only DB; this is used
@@ -985,6 +1004,7 @@ runQuery
               [ noContinuation | incomplete ]
           , resWriteHandle = maybeWriteHandle
           , resFactsSearched = Map.filterWithKey knownPid <$> queryResultsStats
+          , resFactsDerived = factsDerived
           , resType = Just ppType
           , resBytecodeSize = Just bytecodeSize
           , resCompileTime = Just compileTime
@@ -1258,6 +1278,7 @@ emptyResult = Results {
   , resDiags = []
   , resWriteHandle = Nothing
   , resFactsSearched = Nothing
+  , resFactsDerived = Nothing
   , resType = Nothing
   , resBytecodeSize = Nothing
   , resCompileTime = Nothing
@@ -1413,6 +1434,7 @@ withStats io = do
         , Thrift.userQueryStats_elapsed_ns = truncate (secs * 1000000000)
         , Thrift.userQueryStats_allocated_bytes = fromIntegral bytes
         , Thrift.userQueryStats_facts_searched = resFactsSearched res
+        , Thrift.userQueryStats_facts_derived = resFactsDerived res
         , Thrift.userQueryStats_bytecode_size =
             fromIntegral <$> resBytecodeSize res
         , Thrift.userQueryStats_compile_time_ns =

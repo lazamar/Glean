@@ -731,6 +731,10 @@ struct UserQueryStats {
   13: optional map<Id, PredicateRef> declared_predicates;
   // the predicates declared by the query. getSchemaInfo doesn't know
   // them, since they only exist while the query runs
+  14: optional map<Id, i64> facts_derived;
+  // number of facts of each derived predicate that the query derived,
+  // when collect_facts_searched is set. Ids map to PredicateRefs as
+  // in facts_searched.
 }
 
 # Results in Glean's internal binary representation

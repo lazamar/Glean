@@ -39,6 +39,8 @@ If your query is expensive, then likely you will see some large numbers next to 
 
 Predicates [declared in the query](../derived.md#predicates-declared-in-a-query) are listed by the name they have in the query, like `Ancestor`.
 
+The profile also shows how many facts of each derived predicate the query derived, under `Facts derived`. Glean derives the facts of [recursive predicates](../schema/recursion.md#recursive-derived-predicates) while the query runs, so this shows how much work they took. Derived predicates that aren't recursive are expanded into the query instead, and don't appear there.
+
 ## Showing the internals
 
 The shell provides ways to show what Glean's query engine is doing internally. This is mostly useful for those working on the query engine itself, but it might also be helpful when debugging queries.

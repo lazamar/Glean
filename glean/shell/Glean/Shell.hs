@@ -1022,6 +1022,16 @@ runUserQuery sQuery = do
      , let scans = Thrift.userQueryStats_full_scans stats
      ]
      ++
+     [ vcat $ "Facts derived:" :
+         [ pretty (printf "%40s : %d" name count :: String)
+         | (pid, count) <- sortOn (Down . snd) $ Map.toList m
+         , Just (_, name) <- [predicateName schemaInfo stats pid] ]
+     | stats == FullStats
+     , Just stats <- [finalStats]
+     , Just m <- [Thrift.userQueryStats_facts_derived stats]
+     , not (Map.null m)
+     ]
+     ++
      [ vcat $ if Thrift.userQueryStats_result_count stats < fromIntegral limit
          then
              [ case timeout of

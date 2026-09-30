@@ -1230,6 +1230,33 @@ localTest = TestList
       ([s| X where Reach { _, X } |] <> reach)
     assertBool "full scan of Reach" $
       PredicateRef "Reach" 0 `elem` userQueryStats_full_scans scanStats
+
+  , TestLabel "facts derived" $ TestCase $ withGraph $ \env repo schema -> do
+    -- 1 reaches 2, 3 and 4. The stats leave out the facts of the
+    -- auxiliary predicates, and the results.
+    stats <- queryStats =<< runQ env repo
+      ([s| X where Reach { 1, X } |] <> reach)
+    pid <- reachPid stats
+    assertEqual "facts of Reach" (Just (Map.singleton pid 3))
+      (userQueryStats_facts_derived stats)
+
+    -- the same for a recursive predicate of the schema
+    path <- either (assertFailure . unpack) (return . predicatePid) $
+      lookupPredicateSourceRef (parseRef "x.Path") LatestSchema schema
+    pathStats <- queryStats =<< runQ env repo [s| X where x.Path { 1, X } |]
+    assertEqual "facts of x.Path"
+      (Just (Map.singleton (fromIntegral (RTS.fromPid path)) 3))
+      (userQueryStats_facts_derived pathStats)
+
+    -- a predicate that isn't recursive is inlined, and derives nothing
+    inlinedStats <- queryStats =<< runQ env repo
+      [s|
+        X where TwoSteps { 1, X }
+        predicate TwoSteps : { from: nat, to: nat }
+          { A, C } where x.Edge { A, B }; x.Edge { B, C }
+      |]
+    assertEqual "no facts derived" (Just Map.empty)
+      (userQueryStats_facts_derived inlinedStats)
   ]
   where
   -- the Id of Reach in a query's stats

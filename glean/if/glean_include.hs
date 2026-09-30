@@ -53,6 +53,7 @@ instance Prelude.Semigroup UserQueryStats where
       , userQueryStats_full_scans = full_scans1
       , userQueryStats_result_bytes = result_bytes1
       , userQueryStats_declared_predicates = declared_predicates1
+      , userQueryStats_facts_derived = facts_derived1
       }
     UserQueryStats
       { userQueryStats_num_facts = num_facts2
@@ -67,6 +68,7 @@ instance Prelude.Semigroup UserQueryStats where
       , userQueryStats_full_scans = full_scans2
       , userQueryStats_result_bytes = result_bytes2
       , userQueryStats_declared_predicates = declared_predicates2
+      , userQueryStats_facts_derived = facts_derived2
       }
     = UserQueryStats
       { userQueryStats_num_facts = num_facts1 Prelude.+ num_facts2
@@ -92,6 +94,8 @@ instance Prelude.Semigroup UserQueryStats where
           fMaybe (Prelude.+) result_bytes1 result_bytes2
       , userQueryStats_declared_predicates =
           fMaybe Map.union declared_predicates1 declared_predicates2
+      , userQueryStats_facts_derived =
+          fMaybe (Map.unionWith (Prelude.+)) facts_derived1 facts_derived2
       }
       where
       fMaybe _ Prelude.Nothing a = a

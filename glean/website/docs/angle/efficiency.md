@@ -171,7 +171,7 @@ They mean the same thing, but for a query that knows the child, like `example.An
 * In `Ancestor`, the recursive call `Ancestor { C, P }` has the same child as the query. Glean finds the ancestors of `Goldfish` one generation at a time, and each step searches `Parent` by its first field. The work is proportional to the number of ancestors.
 * In `AncestorR`, the recursive call `AncestorR { P, A }` has a different child at each step: the parent of `Goldfish`, then its grandparent, and so on. Glean finds all the ancestors of each of them separately, so the work grows with the square of the number of ancestors.
 
-On a database indexing all of Stackage, finding the 1,031 modules that a module uses, directly or not, took 14 ms with the first shape and 226 ms with the second. The gap grows with the number of results.
+On a database indexing all of Stackage, finding the 1,031 modules that a module uses, directly or not, took 14 ms with the first shape and 226 ms with the second. The gap grows with the number of results. `:profile full` in the shell shows how many facts each recursive predicate derived (see [debugging](debugging.md#debugging-a-slow-query)), which makes the difference easy to see.
 
 ### Searching in the other direction
 

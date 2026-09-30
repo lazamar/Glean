@@ -20,7 +20,7 @@ import Data.Default (def)
 import Data.Int (Int64)
 import Data.List (isInfixOf, nub, sort)
 import qualified Data.Map as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.Text (Text, unpack)
@@ -1210,8 +1210,35 @@ localTest = TestList
       , userQuery_encodings = [ UserQueryEncoding_bin def ]
       }
     assertBadQuery "can't store derived facts" r
+
+  , TestLabel "in the stats" $ TestCase $ withGraph $ \env repo schema -> do
+    -- Calls after the first find its demand completed, and search the
+    -- facts of Reach
+    stats <- queryStats =<< runQ env repo
+      ([s| Y where Reach { 1, _ }; Reach { 1, Y } |] <> reach)
+    pid <- reachPid stats
+    let searched = fromMaybe Map.empty (userQueryStats_facts_searched stats)
+    assertBool "facts of Reach searched" $
+      maybe False (> 0) (Map.lookup pid searched)
+    -- and not the auxiliary predicates of the evaluation
+    forM_ (Map.keys searched) $ \p ->
+      assertBool ("searched a predicate that isn't known: " <> show p) $
+        p == pid || isJust (lookupPid (RTS.Pid p) schema)
+
+    -- With nothing bound, the search for Reach facts is a full scan
+    scanStats <- queryStats =<< runQ env repo
+      ([s| X where Reach { _, X } |] <> reach)
+    assertBool "full scan of Reach" $
+      PredicateRef "Reach" 0 `elem` userQueryStats_full_scans scanStats
   ]
   where
+  -- the Id of Reach in a query's stats
+  reachPid :: UserQueryStats -> IO Int64
+  reachPid stats =
+    case Map.toList <$> userQueryStats_declared_predicates stats of
+      Just [(pid, PredicateRef "Reach" 0)] -> return pid
+      other -> assertFailure $ "declared predicates: " <> show other
+
   reach =
     [s|
       predicate Reach : { from: nat, to: nat }
@@ -1299,6 +1326,12 @@ factsSearched schema ref response = do
       counts <- userQueryStats_facts_searched stats
       Map.lookup (fromIntegral (RTS.fromPid pid)) counts
     Left err -> assertFailure (show err)
+
+queryStats :: Either BadQuery UserQueryResults -> IO UserQueryStats
+queryStats response = case response of
+  Right UserQueryResults{..} ->
+    maybe (assertFailure "no stats") return userQueryResults_stats
+  Left err -> assertFailure (show err)
 
 decodeNats :: Either BadQuery UserQueryResults -> IO [RTS.Value]
 decodeNats response =

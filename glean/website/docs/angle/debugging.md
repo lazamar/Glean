@@ -37,6 +37,8 @@ Facts searched:
 
 If your query is expensive, then likely you will see some large numbers next to one or more predicates. This is a sign that you probably want to reorder the statements in your query, or lift out some nested queries into statements so that you can control the ordering more precisely.
 
+Predicates [declared in the query](../derived.md#predicates-declared-in-a-query) are listed by the name they have in the query, like `Ancestor`.
+
 ## Showing the internals
 
 The shell provides ways to show what Glean's query engine is doing internally. This is mostly useful for those working on the query engine itself, but it might also be helpful when debugging queries.

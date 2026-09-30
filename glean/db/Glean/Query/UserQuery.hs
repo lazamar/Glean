@@ -961,7 +961,7 @@ runQuery
         let bs' = if incomplete then B.empty else bs
         return $ Just $ mkUserQueryCont (Right returnType) bs' nextId
 
-    stats <- getStats schema fullScans qResults
+    stats <- getStats querySchema fullScans qResults
 
     when (isJust userCont) $
       addStatValueType "glean.query.truncated" 1 Stats.Sum
@@ -969,9 +969,10 @@ runQuery
     let ppType = renderStrict $ layoutPretty defaultLayoutOptions $
           displayDefault returnType
 
-        -- leave out predicates that only exist while the query runs, like
-        -- the Demand predicates of recursive queries
-        knownPid pid _ = isJust (lookupPid (Pid pid) schema)
+        -- leave out the auxiliary predicates of recursive queries, like
+        -- Demand, but keep the predicates the query declares. Clients get
+        -- their names from declared_predicates in the stats
+        knownPid pid _ = isJust (lookupPid (Pid pid) querySchema)
 
         results = Results
           { resFacts = Vector.toList queryResultsFacts
@@ -1389,8 +1390,8 @@ getStats schema fullScans QueryResults{..} = do
       Vector.length queryResultsFacts +
       Vector.length queryResultsNestedFacts
 
-    -- leave out predicates that only exist while the query runs, like the
-    -- Demand predicates of recursive queries
+    -- leave out the auxiliary predicates of recursive queries, like Demand,
+    -- which aren't in the schema
     pref pid = predicateIdRef . predicateId <$> lookupPid pid schema
 
   addStatValueType "glean.query.facts" facts Stats.Sum
@@ -1423,6 +1424,12 @@ withStats io = do
         , Thrift.userQueryStats_full_scans = statFullScans $ resStats res
         , Thrift.userQueryStats_result_bytes =
             fromIntegral <$> resResultBytes res
+        , Thrift.userQueryStats_declared_predicates =
+            if IntMap.null (resLocalPredicates res)
+              then Nothing
+              else Just $ Map.fromList
+                [ (fromIntegral pid, predicateIdRef (predicateId details))
+                | (pid, details) <- IntMap.toList (resLocalPredicates res) ]
         }
   return res{ resStats = stats }
 

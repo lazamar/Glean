@@ -553,6 +553,40 @@ recursionTest = TestList
           ]
           (sort facts)
 
+  , TestLabel "keeps values of any type across a recursive call" $
+    TestCase $ do
+    -- A and K are strings bound before the recursive call and used after
+    -- it, and the key has a nested record.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          predicate Edge : { from: string, to: string }
+          predicate Hops :
+            { from: string, to: string, first: { name: string, hops: nat } }
+            { A, B, { K, H } } where
+              x.Edge { A, K };
+              ( B = K; H = 1 ) |
+              ( x.Hops { K, B, { _, N } }; H = N + 1 )
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- a -> b -> c -> d
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": "a", "to": "b" } }|]
+          , [s|{ "key": { "from": "b", "to": "c" } }|]
+          , [s|{ "key": { "from": "c", "to": "d" } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        facts <- decodeResultsAs "x.Hops.1" schema =<< runQ env repo
+          [s| x.Hops { "a", _, _ } |]
+        assertEqual "result content"
+          [ RTS.Tuple
+              [ RTS.String "a", RTS.String to
+              , RTS.Tuple [ RTS.String "b", RTS.Nat hops ] ]
+          | (to, hops) <- [ ("b", 1), ("c", 2), ("d", 3) ] ]
+          (sort facts)
+
   , TestLabel "only derives what the call needs" $ TestCase $ do
     withSchemaAndFacts [enableRecursion]
       [s|
@@ -660,7 +694,53 @@ recursionTest = TestList
         repeated <- runQ env repo
           [s| { X, Y } where x.Path { 1, X }; x.Path { 1, Y } |]
         assertEqual "Edge facts searched" (searched once) (searched repeated)
+
+  , TestLabel "resumes a derivation once for each fact" $ TestCase $ do
+    -- All the facts of x.Path { 1, _ } are derived for the same demand.
+    -- Each x.Path { 1, K } should search for the edges from K once, not
+    -- once in every round after it was derived.
+    withSchemaAndFacts [enableRecursion]
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> ... -> 100
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 99 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        response <- runQ env repo [s| x.Path { 1, _ } |]
+        facts <- decodeResultsAs "x.Path.1" schema response
+        assertEqual "results" 99 (length facts)
+        searched <- factsSearched schema "x.Edge.1" response
+        assertBool ("Edge facts searched: " <> show searched) $
+          searched < 200
   ]
+
+-- | How many facts of a predicate a query searched
+factsSearched
+  :: DbSchema
+  -> Text
+  -> Either BadQuery UserQueryResults
+  -> IO Int64
+factsSearched schema ref response = do
+  pid <- either (assertFailure . unpack) (return . predicatePid) $
+    lookupPredicateSourceRef (parseRef ref) LatestSchema schema
+  case response of
+    Right UserQueryResults{..} -> return $ fromMaybe 0 $ do
+      stats <- userQueryResults_stats
+      counts <- userQueryStats_facts_searched stats
+      Map.lookup (fromIntegral (RTS.fromPid pid)) counts
+    Left err -> assertFailure (show err)
 
 decodeNats :: Either BadQuery UserQueryResults -> IO [RTS.Value]
 decodeNats response =
@@ -865,8 +945,10 @@ referenceTest = TestList
   -- (seed, number of nodes, number of edges)
   graphs = [ (1, 6, 8), (2, 8, 14), (3, 10, 12), (4, 5, 12) ]
 
-  -- the same relation defined in three ways
-  predicates = [ "x.Left.1", "x.Right.1", "x.NonLinear.1" ]
+  -- the same relation defined in different ways
+  predicates =
+    [ "x.Left.1", "x.Right.1", "x.NonLinear.1", "x.Mutual.1"
+    , "x.Nested.1", "x.Then.1", "x.Else.1", "x.Composed.1" ]
 
   checkGraph nodes edges =
     withSchemaAndFacts [enableRecursion]
@@ -883,6 +965,31 @@ referenceTest = TestList
           predicate NonLinear : { from: Node, to: Node }
             { A, B } where
               x.Edge { A, B } | (x.NonLinear { A, K }; x.NonLinear { K, B })
+          # mutual recursion
+          predicate Mutual : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Edge { A, K }; x.MutualStep { K, B })
+          predicate MutualStep : { from: Node, to: Node }
+            { A, B } where x.Mutual { A, B }
+          # calls in alternatives of a disjunction and of an if
+          predicate Nested : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, K };
+              B = (K | (X where x.Nested { K, X }))
+          predicate Then : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, K };
+              B = if (x.Edge { K, _ })
+                then (K | (X where x.Then { K, X }))
+                else K
+          predicate Else : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, K };
+              B = if (K = 0) then K else (K | (X where x.Else { K, X }))
+          # a call to a lower component after a call to its own
+          predicate Composed : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Composed { A, K }; x.Right { K, B })
         }
         schema all.1 : x.1 {}
       |]

@@ -313,19 +313,21 @@ refersToRecursive ref = do
     EnableRecursion -> return ()
 
 -- | The query returning the key and value of each fact of a recursive
--- predicate that matches a demand (see Note [Evaluating recursive
--- predicates] in Glean.Query.Recursion):
+-- predicate that matches a demand, and the demand (see Note [Evaluating
+-- recursive predicates] in Glean.Query.Recursion):
 --
--- > { Key, Value } where
--- >   Demand { X.. };
+-- > { Key, Value, D } where
+-- >   D = Demand { X.. };
 -- >   <derivation of P, with the bound fields of its key set to X..>
 --
+-- Also returns D, which is bound before the query runs (see
+-- Note [Suspension] in Glean.Query.Recursion).
 flattenDerivation
   :: DbSchema
   -> Schema.PredicateId
   -> PidRef -- ^ the Demand predicate
   -> [Bool] -- ^ which fields of the key the demand binds
-  -> Except Text FlattenedQuery
+  -> Except Text (FlattenedQuery, Var)
 flattenDerivation dbSchema ref demand bound =
   flip evalStateT state $ do
     PredicateDetails{..} <- getPredicateDetails ref
@@ -337,19 +339,21 @@ flattenDerivation dbSchema ref demand bound =
       DerivedFactGenerator _ key val -> return (key, val)
       _ -> throwError $ "internal error: flattenDerivation: " <>
         Text.pack (show (displayDefault ref))
+    let demandTy = Angle.PredicateTy () demand
+    d <- fresh demandTy
     nextVar <- gets flNextVar
     let
-      demandTy = Angle.PredicateTy () demand
-      -- see Note [Semi-naive evaluation] in Glean.Query.Recursion
-      demandStmt = FlatStatement demandTy (Ref (MatchWild demandTy))
-        (FactGenerator demand demandPat (Tuple []) SeekOnRound)
-    return QueryWithInfo
-      { qiQuery = FlatQuery (Tuple [key, val]) Nothing $
-          mkStatementGroup (Floating demandStmt : flattenStmts stmts)
-      , qiNumVars = nextVar
-      , qiGenerator = Nothing
-      , qiReturnType = tupleSchema [predicateKeyType, predicateValueType]
-      }
+      demandStmt = FlatStatement demandTy (Ref (MatchBind d))
+        (FactGenerator demand demandPat (Tuple []) SeekOnAllFacts)
+      query = QueryWithInfo
+        { qiQuery = FlatQuery (Tuple [key, val, Ref (MatchVar d)]) Nothing $
+            mkStatementGroup (Floating demandStmt : flattenStmts stmts)
+        , qiNumVars = nextVar
+        , qiGenerator = Nothing
+        , qiReturnType =
+            tupleSchema [predicateKeyType, predicateValueType, demandTy]
+        }
+    return (query, d)
   where
   state = initialFlattenState EnableRecursion dbSchema 0 (Just ref)
 

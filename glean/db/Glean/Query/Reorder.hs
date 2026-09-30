@@ -10,6 +10,7 @@
 
 module Glean.Query.Reorder
   ( reorder
+  , reorderWithBound
   ) where
 
 import Control.Applicative ((<|>))
@@ -133,15 +134,31 @@ get all the way through the list, give up.
 
 
 reorder :: Schema.DbSchema -> FlattenedQuery -> Except Text CodegenQuery
-reorder dbSchema QueryWithInfo{..} =
+reorder dbSchema = reorderWithBound dbSchema []
+
+-- | Reorder a query that runs where some of its variables are already
+-- bound. Variables are renumbered, so the query must refer to them in its
+-- head for the caller to find them.
+reorderWithBound
+  :: Schema.DbSchema
+  -> [Var]
+  -> FlattenedQuery
+  -> Except Text CodegenQuery
+reorderWithBound dbSchema bound QueryWithInfo{..} =
   withExcept (\(e, _) -> Text.pack $ show $
     vcat [pretty e, nest 2 $ vcat [ "in:", displayDefault qiQuery]]) qi
   where
     qi = do
       ((q,gen), ReorderState{..}) <-
-        flip runStateT (initialReorderState qiNumVars dbSchema) $ do
+        flip runStateT initialState $ do
           go qiQuery
       return (QueryWithInfo q roNextVar gen qiReturnType)
+
+    initialState = (initialReorderState qiNumVars dbSchema)
+      { roScope = Scope
+          (IntSet.fromList (map varId bound))
+          (IntMap.fromList [ (varId var, var) | var <- bound ])
+      }
 
     -- 1. replace all wildcards with fresh variables
     -- 2. reorder the statements

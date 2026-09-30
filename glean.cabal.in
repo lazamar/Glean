@@ -675,6 +675,7 @@ library db
         Glean.Query.Flatten.Types
         Glean.Query.Opt
         Glean.Query.Prune
+        Glean.Query.Recursion
         Glean.Query.Reorder
         Glean.Query.Typecheck
         Glean.Query.Typecheck.Monad

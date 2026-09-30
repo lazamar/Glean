@@ -22,6 +22,7 @@ module Glean.Angle.Types
   , TypeRef(..)
   , PredicateId(..)
   , tempPredicateId
+  , queryPredicateId
   , TypeId(..)
 
   -- * Source locations
@@ -596,6 +597,13 @@ instance Eq TypeId where
 -- Used by query compilation
 tempPredicateId :: PredicateId
 tempPredicateId = PredicateId (PredicateRef "_tmp_" 0) hash0
+
+-- | The id of a predicate that only exists while a query is compiled and
+-- run, like the auxiliary predicates for evaluating recursive predicates.
+-- Ids are compared by their hash, so each name gets a hash of its own.
+queryPredicateId :: Name -> PredicateId
+queryPredicateId name =
+  PredicateId (PredicateRef name 0) (hashByteString (Text.encodeUtf8 name))
 
 instance Binary TypeRef where
   put (TypeRef a b) = put a >> put b

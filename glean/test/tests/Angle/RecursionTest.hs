@@ -10,7 +10,10 @@
 module Angle.RecursionTest (main) where
 
 import Control.Exception
-import Control.Monad (forM_)
+import Control.Monad (forM, forM_)
+import qualified Data.Aeson as Aeson
+import qualified Data.Aeson.Key as Key
+import qualified Data.Aeson.KeyMap as KeyMap
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Default (def)
@@ -26,7 +29,8 @@ import Test.HUnit
 import TestRunner
 import Util.String.Quasi
 
-import Glean.Angle.Types (AngleVersion(..), Type_(NatTy), latestAngleVersion)
+import Glean.Angle.Types
+  (AngleVersion(..), FieldDef_(..), Type_(NatTy, RecordTy), latestAngleVersion)
 import Glean.Database.Schema.Types
 import Glean.Database.Types (Env)
 import Glean.Init
@@ -948,6 +952,338 @@ recursionTest = TestList
           (sort facts)
   ]
 
+-- | Predicates declared by a query. See Note [Query-local predicates] in
+-- Glean.Query.UserQuery.
+localTest :: Test
+localTest = TestList
+  [ TestLabel "recursive" $ TestCase $ withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Reach { 1, X }
+        predicate Reach : { from: nat, to: nat }
+          { A, B } where x.Edge { A, B } | (Reach { A, K }; x.Edge { K, B })
+      |]
+    assertEqual "nodes reachable from 1" (map RTS.Nat [2, 3, 4]) (sort nodes)
+
+  , TestLabel "not recursive" $ TestCase $ withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where TwoSteps { 1, X }
+        predicate TwoSteps : { from: nat, to: nat }
+          { A, C } where x.Edge { A, B }; x.Edge { B, C }
+      |]
+    assertEqual "two steps from 1" [RTS.Nat 3] nodes
+
+  , TestLabel "calling each other" $ TestCase $ withGraph $ \env repo _ -> do
+    -- Even refers to Odd, which is declared after it
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Odd { 1, X }
+        predicate Even : { from: nat, to: nat }
+          { A, B } where Odd { A, K }; x.Edge { K, B }
+        predicate Odd : { from: nat, to: nat }
+          { A, B } where x.Edge { A, B } | (Even { A, K }; x.Edge { K, B })
+      |]
+    assertEqual "an odd number of steps from 1"
+      (map RTS.Nat [2, 4]) (sort nodes)
+
+  , TestLabel "calling a recursive schema predicate" $ TestCase $
+    withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Far { 1, X }
+        predicate Far : { from: nat, to: nat }
+          { A, B } where x.Path { A, B }; !x.Edge { A, B }
+      |]
+    assertEqual "more than one step from 1" (map RTS.Nat [3, 4]) (sort nodes)
+
+  , TestLabel "with a value" $ TestCase $ withGraph $ \env repo _ -> do
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        V where Next 3 -> V
+        predicate Next : nat -> nat
+          A -> B where x.Edge { A, B }
+      |]
+    assertEqual "after 3" [RTS.Nat 4] nodes
+
+  , TestLabel "names don't shadow the schema's" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- the schema's predicates have qualified names
+    nodes <- decodeNats =<< runQ env repo
+      [s|
+        X where Edge X
+        predicate Edge : nat
+          X where x.Edge { 1, X }
+      |]
+    assertEqual "after 1" [RTS.Nat 2] nodes
+
+  , TestLabel "declared once" $ TestCase $ withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          X where X = 1
+        predicate P : nat
+          X where X = 2
+      |]
+    assertBadQuery "predicate declared more than once: P" r
+
+  , TestLabel "derived on demand only" $ TestCase $
+    withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          stored X where X = 1
+      |]
+    assertBadQuery "can't be stored" r
+
+  , TestLabel "typechecked" $ TestCase $ withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          X where X = "a"
+      |]
+    assertBadQuery "In P" r
+
+  , TestLabel "no recursion through negation" $ TestCase $
+    withGraph $ \env repo _ -> do
+    r <- runQ env repo
+      [s|
+        X where P X
+        predicate P : nat
+          N where x.Edge { N, _ }; !Q N
+        predicate Q : nat
+          N where P N
+      |]
+    assertBadQuery "recursion through negation" r
+
+  , TestLabel "returning their facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- as facts of the temporary predicate, so binary works
+    facts <- either assertFailure return =<<
+      decodeResults
+        (RecordTy [FieldDef "from" NatTy, FieldDef "to" NatTy])
+        userQueryResultsBin_facts
+      =<< runQ env repo ([s| Reach { 1, _ } |] <> reach)
+    assertEqual "paths from 1"
+      [ RTS.Tuple [RTS.Nat 1, RTS.Nat n] | n <- [2, 3, 4] ]
+      (sort facts)
+
+  , TestLabel "keys and values of their facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    (facts, _) <- runJSON env repo True
+      [s|
+        Next _
+        predicate Next : nat -> nat
+          A -> B where x.Edge { A, B }
+      |]
+    assertEqual "keys and values"
+      [ Just (1, 2), Just (2, 3), Just (3, 4), Just (10, 11) ]
+      (sort
+        [ (,) <$> (nat =<< field ["key"] fact)
+            <*> (nat =<< field ["value"] fact)
+        | fact <- facts ])
+
+  , TestLabel "nested facts, expanded" $ TestCase $
+    withGraph $ \env repo _ -> do
+    (facts, nested) <- runJSON env repo True
+      ([s| { R, X } where R = Reach { 1, X } |] <> reach)
+    assertEqual "no separate nested facts" 0 (Map.size nested)
+    assertEqual "facts in the results"
+      [ Just (1, n) | n <- [2, 3, 4] ]
+      (sort
+        [ do
+            (from, to) <- reachKey =<< field ["key", "tuplefield0"] fact
+            x <- nat =<< field ["key", "tuplefield1"] fact
+            if to == x then Just (from, to) else Nothing
+        | fact <- facts ])
+
+  , TestLabel "nested facts, not expanded" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- they're returned even though the query doesn't ask for nested facts
+    (facts, nested) <- runJSON env repo False
+      ([s| { R, X } where R = Reach { 1, X } |] <> reach)
+    paths <- forM facts $ \fact -> do
+      ref <- maybe (assertFailure "no reference") return $
+        nat =<< field ["key", "tuplefield0", "id"] fact
+      nestedFact <- maybe (assertFailure "not a nested fact") return $
+        Map.lookup (fromIntegral ref) nested
+      return (reachKey nestedFact)
+    assertEqual "facts in the results"
+      [ Just (1, n) | n <- [2, 3, 4] ] (sort paths)
+
+  , TestLabel "nested facts of nested facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- a declared predicate whose key has facts of another
+    (facts, _) <- runJSON env repo True
+      [s|
+        Hop _
+        predicate Hop : { first: Step, second: Step }
+          { S1, S2 } where S1 = Step { _, B }; S2 = Step { B, _ }
+        predicate Step : { from: nat, to: nat }
+          { A, B } where x.Edge { A, B }
+      |]
+    assertEqual "hops"
+      [ Just ((1, 2), (2, 3)), Just ((2, 3), (3, 4)) ]
+      (sort
+        [ (,) <$> (reachKey =<< field ["key", "first"] fact)
+            <*> (reachKey =<< field ["key", "second"] fact)
+        | fact <- facts ])
+
+  , TestLabel "nested facts in a binary encoding" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- the client couldn't decode them
+    r <- runQ env repo ([s| { R, X } where R = Reach { 1, X } |] <> reach)
+    assertBadQuery "only the JSON encoding can return" r
+
+  , TestLabel "returning their facts up to a limit" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- resuming the query fails before compiling the continuation's type,
+    -- which refers to Reach
+    let
+      options = def
+        { userQueryOptions_syntax = QuerySyntax_ANGLE
+        , userQueryOptions_max_results = Just 1
+        }
+      query = def
+        { userQuery_query = [s| Reach _ |] <> reach
+        , userQuery_options = Just options
+        , userQuery_encodings = [ UserQueryEncoding_bin def ]
+        }
+    UserQueryResults{..} <- userQuery env repo query
+    cont <- maybe (assertFailure "no continuation") return
+      userQueryResults_continuation
+    r <- try $ userQuery env repo query
+      { userQuery_options = Just options
+          { userQueryOptions_continuation = Just cont } }
+    assertBadQuery "can't be continued" r
+
+  , TestLabel "results up to a limit, without continuing" $ TestCase $
+    withGraph $ \env repo _ -> do
+    -- TwoSteps isn't recursive, but the query still can't be continued
+    -- because its continuation wouldn't have the declaration.
+    let
+      options = def
+        { userQueryOptions_syntax = QuerySyntax_ANGLE
+        , userQueryOptions_max_results = Just 1
+        }
+      query = def
+        { userQuery_query =
+            [s|
+              X where TwoSteps { _, X }
+              predicate TwoSteps : { from: nat, to: nat }
+                { A, C } where x.Edge { A, B }; x.Edge { B, C }
+            |]
+        , userQuery_options = Just options
+        , userQuery_encodings = [ UserQueryEncoding_bin def ]
+        }
+      noContinuation = "can't be continued"
+    UserQueryResults{..} <- userQuery env repo query
+    case userQueryResults_results of
+      UserQueryEncodedResults_bin bin ->
+        assertEqual "results" 1 (Map.size (userQueryResultsBin_facts bin))
+      _ -> assertFailure "unexpected encoding"
+    assertBool "diagnostic" $
+      any ((noContinuation `isInfixOf`) . unpack) userQueryResults_diagnostics
+    cont <- maybe (assertFailure "no continuation") return
+      userQueryResults_continuation
+    r <- try $ userQuery env repo query
+      { userQuery_options = Just options
+          { userQueryOptions_continuation = Just cont } }
+    assertBadQuery noContinuation r
+
+  , TestLabel "can't store derived facts" $ TestCase $
+    withGraph $ \env repo _ -> do
+    r <- try $ userQuery env repo $ def
+      { userQuery_query =
+          [s|
+            X where P X
+            predicate P : nat
+              X where X = 1
+          |]
+      , userQuery_options = Just def
+          { userQueryOptions_syntax = QuerySyntax_ANGLE
+          , userQueryOptions_store_derived_facts = True
+          }
+      , userQuery_encodings = [ UserQueryEncoding_bin def ]
+      }
+    assertBadQuery "can't store derived facts" r
+  ]
+  where
+  reach =
+    [s|
+      predicate Reach : { from: nat, to: nat }
+        { A, B } where x.Edge { A, B } | (Reach { A, K }; x.Edge { K, B })
+    |]
+
+  -- the key of a Reach fact in JSON
+  reachKey :: Aeson.Value -> Maybe (Int, Int)
+  reachKey fact = (,)
+    <$> (nat =<< field ["key", "from"] fact)
+    <*> (nat =<< field ["key", "to"] fact)
+
+  -- 1 -> 2 -> 3 -> 4, 10 -> 11
+  withGraph :: (Env -> Repo -> DbSchema -> IO ()) -> IO ()
+  withGraph = withSchemaAndFacts []
+    [s|
+      schema x.1 {
+        type Node = nat
+        predicate Edge : { from: Node, to: Node }
+        predicate Path : { from: Node, to: Node }
+          { A, B } where
+            x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+      }
+      schema all.1 : x.1 {}
+    |]
+    [ mkBatch (PredicateRef "x.Edge" 1)
+        [ [s|{ "key": { "from": 1, "to": 2 } }|]
+        , [s|{ "key": { "from": 2, "to": 3 } }|]
+        , [s|{ "key": { "from": 3, "to": 4 } }|]
+        , [s|{ "key": { "from": 10, "to": 11 } }|]
+        ]
+    ]
+
+-- | Run a query with the JSON encoding, returning its results and nested
+-- facts.
+runJSON
+  :: Env
+  -> Repo
+  -> Bool -- ^ expand nested facts in the results
+  -> ByteString
+  -> IO ([Aeson.Value], Map.Map Int64 Aeson.Value)
+runJSON env repo expand query = do
+  UserQueryResults{..} <- userQuery env repo $ def
+    { userQuery_query = query
+    , userQuery_options = Just def
+      { userQueryOptions_syntax = QuerySyntax_ANGLE
+      , userQueryOptions_expand_results = expand
+      , userQueryOptions_recursive = False
+      }
+    }
+  let decode = either assertFailure return . Aeson.eitherDecodeStrict
+  facts <- mapM decode userQueryResults_facts
+  nested <- traverse decode userQueryResults_nestedFacts
+  return (facts, nested)
+
+-- | A field of a JSON object, following a path of field names
+field :: [Text] -> Aeson.Value -> Maybe Aeson.Value
+field [] v = Just v
+field (f : fs) (Aeson.Object o) = field fs =<< KeyMap.lookup (Key.fromText f) o
+field _ _ = Nothing
+
+nat :: Aeson.Value -> Maybe Int
+nat (Aeson.Number n) = Just (truncate n)
+nat _ = Nothing
+
+assertBadQuery :: String -> Either BadQuery a -> IO ()
+assertBadQuery expected r = case r of
+  Left (BadQuery err) ->
+    assertBool ("error should mention " <> expected <> ":\n" <> unpack err) $
+      expected `isInfixOf` unpack err
+  Right _ -> assertFailure "the query was accepted"
+
 -- | How many facts of a predicate a query searched
 factsSearched
   :: DbSchema
@@ -1277,4 +1613,5 @@ main = withUnitTest $ testRunner $ TestList
   , TestLabel "stratification" stratificationTest
   , TestLabel "stored predicates" storedTest
   , TestLabel "reference" referenceTest
+  , TestLabel "query-local predicates" localTest
   ]

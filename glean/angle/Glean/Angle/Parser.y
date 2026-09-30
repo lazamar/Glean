@@ -4,6 +4,7 @@
 module Glean.Angle.Parser
   ( parseQuery
   , parseQueryWithVersion
+  , parseQueryWithPredicates
   , parseSchema
   , stripAngleVersion
   , parseSchemaWithVersion
@@ -90,6 +91,7 @@ import Glean.Angle.Types as Schema
 
 
 %name query query
+%name queryWithPredicates queryWithPredicates
 %name schema schemas
 %name type_ type
 %monad { P }
@@ -103,6 +105,23 @@ query :: { SourceQuery }
 query
   : pattern 'where' seplist_(statement,';') { SourceQuery (Just $1) $3 Ordered }
   | seplist_(statement,';')  { SourceQuery Nothing $1 Ordered }
+
+-- A query followed by the predicates it declares. See
+-- Note [Query-local predicates] in Glean.Query.UserQuery.
+queryWithPredicates :: { (SourceQuery, [Schema.SourcePredicateDef]) }
+queryWithPredicates
+  : query list(localpredicate)  { ($1, $2) }
+
+localpredicate :: { Schema.SourcePredicateDef }
+localpredicate
+  : 'predicate' uident ':' type optval deriving
+    { Schema.PredicateDef
+        { predicateDefRef = SourceRef (lval $2) Nothing
+        , predicateDefKeyType = lval $4
+        , predicateDefValueType = $5
+        , predicateDefDeriving = lval $6
+        , predicateDefSrcSpan = s $1 $6 }
+    }
 
 statement :: { SourceStatement }
 statement
@@ -421,6 +440,14 @@ seplistSpan0(p,sep)
 {
 parseQuery :: ByteString -> Either String SourceQuery
 parseQuery bs = runAlex (LB.fromStrict bs) $ query
+
+-- | Parse a query followed by the predicates it declares. See
+-- Note [Query-local predicates] in Glean.Query.UserQuery.
+parseQueryWithPredicates
+  :: ByteString
+  -> Either String (SourceQuery, [Schema.SourcePredicateDef])
+parseQueryWithPredicates bs =
+  runAlex (LB.fromStrict bs) queryWithPredicates
 
 parseType :: ByteString -> Either String Schema.SourceType
 parseType bs = runAlex (LB.fromStrict bs) $ fmap lval type_

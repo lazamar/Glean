@@ -603,6 +603,8 @@ userQueryWrites env odb config bounds lookup repo pred q = do
             SeekOnAllFacts -> hasFacts pid stackStats
             SeekOnBase -> hasFacts pid baseStats
             SeekOnStacked -> hasFacts pid topStats
+            -- only the facts derived by a recursive query
+            SeekOnRound -> True
       return pidHasFacts
 
     stats opts =

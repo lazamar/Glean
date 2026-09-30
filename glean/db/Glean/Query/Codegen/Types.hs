@@ -88,14 +88,16 @@ data CgStatement_ var
     , then_ :: [CgStatement_ var]
     , else_ :: [CgStatement_ var]
     }
-  | CgRec [(PidRef, CodegenQuery)]
+  | CgRec [CgStatement_ var] [(PidRef, CodegenQuery)]
     -- ^ Derive the facts of recursive predicates that have been
-    -- demanded. There is a query for each predicate and binding pattern,
-    -- returning the key and value of its demanded facts. We run the
-    -- queries and create facts from their results until they stop
-    -- producing new facts. Each query has its own variables, and none of
-    -- them are visible to the statements that follow.
-    -- See Note [Evaluating recursive predicates] in Glean.Query.Recursion.
+    -- demanded. The statements run first and create a demand. There is a
+    -- query for each predicate and binding pattern, returning the key and
+    -- value of its demanded facts. We run the queries and create facts
+    -- from their results until they stop producing new facts. Each query
+    -- has its own variables, and none of them are visible to the
+    -- statements that follow.
+    -- See Note [Evaluating recursive predicates] and
+    -- Note [Semi-naive evaluation] in Glean.Query.Recursion.
   deriving (Show, Functor, Foldable, Traversable)
 
 
@@ -349,8 +351,9 @@ instance Display CgStatement where
       , nest 2 $ sep ["then", doStmts then_]
       , nest 2 $ sep ["else", doStmts else_]
       ]
-    CgRec queries -> hang 2 $ sep
-      [ "rec ("
+    CgRec first queries -> hang 2 $ sep
+      [ "rec" <+> doStmts first
+      , "("
       , sep $ punctuate ";"
           [ hang 2 $ sep [display opts pid <+> "<-", display opts (qiQuery q)]
           | (pid, q) <- queries ]
@@ -371,6 +374,7 @@ instance Display Generator where
       SeekOnAllFacts -> ""
       SeekOnBase -> "<base>"
       SeekOnStacked -> "<stacked>"
+      SeekOnRound -> "<round>"
     isUnit (Tuple []) = True
     isUnit _ = False
   display opts (TermGenerator q) = display opts q

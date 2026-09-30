@@ -279,10 +279,24 @@ std::unique_ptr<FactIterator> FactSet::seekWithinSection(
     return seek(type, prefix, restart);
   }
 
-  // We have no use case for actually performing a bounded
-  // seek of a FactSet, therefore we would rather know if
-  // anything tries to trigger it.
-  error("FactSet::seekWithinSection: bounds too narrow");
+  // Recursive queries search for the facts derived in particular rounds of
+  // their evaluation, which are the facts in a range of ids.
+  if (restart.has_value()) {
+    error("FactSet::seekWithinSection: can't restart a bounded seek");
+  }
+  const auto count = keys.lookup(type) ? keys.lookup(type)->size() : 0;
+  const auto lo = std::max(from, startingId());
+  const auto hi = std::min(to, firstFreeId());
+  if (count == 0 || hi <= lo) {
+    return std::make_unique<EmptyIterator>();
+  }
+  if (prefix.empty()) {
+    return factsWithin(type, lo, hi);
+  } else {
+    return FactIterator::filter(
+        seek(type, prefix, prefix.size()),
+        [lo, hi](Id id) { return lo <= id && id < hi; });
+  }
 }
 
 struct FactSet::IdIndex {
@@ -297,6 +311,47 @@ struct FactSet::IdIndex {
   };
   folly::Synchronized<Data> data;
 };
+
+std::unique_ptr<FactIterator> FactSet::factsWithin(Pid type, Id from, Id to) {
+  struct Iterator final : FactIterator {
+    // Positions in 'ids' rather than iterators, because facts (and so ids)
+    // can be added while we iterate, which can reallocate the vector.
+    Iterator(const Facts& f, const std::vector<Id>& i, size_t p, size_t e)
+        : facts(f), ids(i), pos(p), end(e) {}
+
+    void next() override {
+      assert(pos < end);
+      ++pos;
+    }
+
+    Fact::Ref get(Demand) override {
+      return pos < end ? facts[distance(facts.startingId(), ids[pos])]
+                       : Fact::Ref::invalid();
+    }
+
+    std::optional<Id> lower_bound() override {
+      return std::nullopt;
+    }
+    std::optional<Id> upper_bound() override {
+      return std::nullopt;
+    }
+
+    const Facts& facts;
+    const std::vector<Id>& ids;
+    size_t pos;
+    const size_t end;
+  };
+
+  const auto p = idsOf(type);
+  if (p == nullptr) {
+    return std::make_unique<EmptyIterator>();
+  }
+  const auto& ids = *p;
+  const auto begin = std::lower_bound(ids.begin(), ids.end(), from);
+  const auto end = std::lower_bound(begin, ids.end(), to);
+  return std::make_unique<Iterator>(
+      facts, ids, begin - ids.begin(), end - ids.begin());
+}
 
 const std::vector<Id>* FactSet::idsOf(Pid type) {
   auto wlock = id_index.value().data.wlock();

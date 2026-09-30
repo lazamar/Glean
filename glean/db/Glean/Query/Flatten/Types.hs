@@ -43,7 +43,6 @@ import Glean.Angle.Types ( PredicateId )
 import Glean.Query.Codegen.Types
 import Glean.Database.Schema
 import Glean.Database.Schema.Types
-import Glean.Database.Types (EnableRecursion(..))
 import Glean.Display
 import Glean.RTS.Types as RTS
 import Glean.Query.Vars
@@ -281,7 +280,6 @@ data FlattenState = FlattenState
     -- stored or recursive, because we are deriving its facts. Only the
     -- first reference is expanded, so recursive references search for
     -- the facts derived so far.
-  , flRecursion :: EnableRecursion
   }
 
 getPredicateDetails :: PredicateId -> F PredicateDetails
@@ -292,16 +290,14 @@ getPredicateDetails pred = do
     Just d -> return d
 
 initialFlattenState
-  :: EnableRecursion
-  -> DbSchema
+  :: DbSchema
   -> Int
   -> Maybe PredicateId
   -> FlattenState
-initialFlattenState rec dbSchema nextVar derive = FlattenState
+initialFlattenState dbSchema nextVar derive = FlattenState
   { flDbSchema = dbSchema
   , flNextVar = nextVar
   , flDerive = derive
-  , flRecursion = rec
   }
 
 type F a = StateT FlattenState (Except Text) a

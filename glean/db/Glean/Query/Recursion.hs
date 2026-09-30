@@ -248,6 +248,36 @@ predicates, and code generation routes their facts, searches and
 lookups to the store of the evaluation being compiled.
 -}
 
+{- Note [Caching]
+
+Isolated evaluations (Note [Isolation]) don't share work, so a query
+that calls a recursive predicate many times with the same demand would
+derive the same facts every time. To avoid that we cache completed
+demands (section 14 of the design):
+
+* When an evaluation reaches its fixpoint, every demand in its store has
+  been fully evaluated. That's the call's own demand and every demand
+  created while evaluating it. So before freeing the store we create a
+  Completed fact for each of them, with the same key as the demand.
+  Like Demand, there is a Completed predicate for each predicate and
+  binding pattern, but its facts go in the query's fact set so that they
+  outlive the evaluation.
+
+* A call first looks for a Completed fact for its demand. If there is
+  one then all the facts it needs are already there, so it just
+  searches for them:
+
+    if (Completed_P_bf { "a" }) then P { "a", X } else <evaluate>
+
+  A call to the predicate's own component inside a derivation does the
+  same instead of suspending. This lets an evaluation reuse the subgoals
+  that earlier evaluations completed.
+
+An evaluation that is left early (e.g. by a negation that found a
+result) doesn't mark anything as completed, so a later call with the
+same demand will evaluate it again.
+-}
+
 -- | Derive the facts of the recursive predicates that a query searches
 -- for. See Note [Evaluating recursive predicates].
 expandRecursion
@@ -271,6 +301,7 @@ expandRecursion dbSchema compile query
     , exRequired = Set.empty
     , exOwnCalls = IntMap.empty
     , exAuxiliary = IntMap.empty
+    , exCompleted = Map.empty
     }
 
 -- | Which fields of the key of a predicate are bound at a call. For a
@@ -300,6 +331,8 @@ data ExpandState = ExpandState
   , exAuxiliary :: IntMap [PidRef]
     -- ^ the auxiliary predicates of each component, by its index. Their
     -- facts live in the store of an evaluation, see Note [Isolation].
+  , exCompleted :: Map Call PidRef
+    -- ^ the Completed predicate for each call, see Note [Caching]
   }
 
 type E a = StateT ExpandState (Except Text) a
@@ -343,9 +376,10 @@ expandStmts inside = fmap concat . mapM expandStmt
   one = fmap (:[])
 
 -- | The statements that replace a search for facts. If it's a call to a
--- recursive predicate, we create its demand and evaluate it. If the query
--- we are in evaluates the same component, we leave the search to be
--- suspended instead (Note [Suspension]).
+-- recursive predicate whose demand hasn't been completed (Note [Caching]),
+-- we create its demand and evaluate it. If the query we are in evaluates
+-- the same component, we leave the search to be suspended instead
+-- (Note [Suspension]).
 call :: Maybe Int -> CgStatement -> V [CgStatement]
 call inside search = do
   dbSchema <- lift $ gets exSchema
@@ -361,18 +395,29 @@ call inside search = do
         this = (ref, binding)
       demand <- lift $ demandPredicate this
       fid <- freshVar (Angle.PredicateTy () demand)
+      completed <- lift $ completedPredicate this
       let
         create = CgStatement (Ref (MatchBind fid))
           (DerivedFactGenerator demand demandKey (Tuple []))
+        -- if the demand has been completed, just search (Note [Caching])
+        ifCompleted evaluate = CgConditional
+          { cond =
+              [ CgStatement (Ref (MatchWild (Angle.PredicateTy () completed)))
+                  (FactGenerator completed demandKey (Tuple []) SeekOnAllFacts)
+              ]
+          , then_ = [search]
+          , else_ = evaluate
+          }
       if inside == Just (componentIndex component)
         then do
           lift $ modify $ \s -> s
             { exRequired = Set.insert this (exRequired s)
             , exOwnCalls = IntMap.insert (varId fid) this (exOwnCalls s)
             }
-          return [create, search]
+          return [ifCompleted [create, search]]
         else do
-          derivations <- lift $ componentDerivations this
+          (derivations, calls) <- lift $ componentDerivations this
+          complete <- mapM completeDemands (Set.toList calls)
           auxiliary <- lift $ gets $
             IntMap.findWithDefault [] (componentIndex component) . exAuxiliary
           supply <- lift $ supplyPredicate this
@@ -394,8 +439,29 @@ call inside search = do
                   (TermGenerator (Ref (MatchVar fid)))
               ]
           return
-            [CgRec [create] derivations auxiliary
-              (supplied <> found search fact)]
+            [ ifCompleted
+                [ CgRec [create] derivations auxiliary
+                    (supplied <> found search fact) complete ]
+            ]
+
+-- | The statements marking every demand of a call in an evaluation's
+-- store as completed. See Note [Caching].
+completeDemands :: Call -> V [CgStatement]
+completeDemands this = do
+  demand <- lift $ demandPredicate this
+  completed <- lift $ completedPredicate this
+  demandDetails <- lift $ getDetails (pidRefId demand)
+  key <- freshVar (predicateKeyType demandDetails)
+  done <- freshVar (Angle.PredicateTy () completed)
+  return
+    [ CgStatement (Ref (MatchWild (Angle.PredicateTy () demand)))
+        (FactGenerator demand (Ref (MatchBind key)) (Tuple []) SeekOnAllFacts)
+    -- a DerivedFactGenerator whose result isn't bound creates nothing
+    , CgStatement (Ref (MatchBind done))
+        (DerivedFactGenerator completed (Ref (MatchVar key)) (Tuple []))
+    ]
+  where
+  pidRefId (PidRef _ ref) = ref
 
 freshVar :: Monad m => Type -> StateT Int m Var
 freshVar ty = do
@@ -485,14 +551,40 @@ callName kind (ref, binding) =
   kind <> ":" <> showRef (predicateIdRef ref) <> ":" <>
   Text.pack [ if bound then 'b' else 'f' | bound <- binding ]
 
--- | A predicate that only exists while the query runs, for evaluating
--- the component of a call. See Note [Isolation].
+-- | The Completed predicate for a call, which records which of its
+-- demands have been fully evaluated. See Note [Caching].
+completedPredicate :: Call -> E PidRef
+completedPredicate this = do
+  existing <- gets (Map.lookup this . exCompleted)
+  case existing of
+    Just completed -> return completed
+    Nothing -> do
+      PidRef _ demandRef <- demandPredicate this
+      demandDetails <- getDetails demandRef
+      completed <- newPredicate (callName "completed" this)
+        (predicateKeyType demandDetails)
+      modify $ \s ->
+        s { exCompleted = Map.insert this completed (exCompleted s) }
+      return completed
+
+-- | A predicate for evaluating the component of a call. Its facts live
+-- in the evaluation's store. See Note [Isolation].
 auxiliaryPredicate :: Call -> Text -> Type -> E PidRef
 auxiliaryPredicate (owner, _) name keyTy = do
   component <- gets (HashMap.lookup owner . recursiveComponents . exSchema)
   index <- case component of
     Just c -> return (componentIndex c)
     Nothing -> throwError "internal error: auxiliaryPredicate"
+  predicate <- newPredicate name keyTy
+  modify $ \s -> s
+    { exAuxiliary =
+        IntMap.insertWith (<>) index [predicate] (exAuxiliary s)
+    }
+  return predicate
+
+-- | A predicate that only exists while the query runs
+newPredicate :: Text -> Type -> E PidRef
+newPredicate name keyTy = do
   pid <- gets exNextPid
   let
     ref = queryPredicateId name
@@ -510,8 +602,6 @@ auxiliaryPredicate (owner, _) name keyTy = do
   modify $ \s -> s
     { exNextPid = succ pid
     , exSchema = addPredicate details (exSchema s)
-    , exAuxiliary =
-        IntMap.insertWith (<>) index [PidRef pid ref] (exAuxiliary s)
     }
   return (PidRef pid ref)
 
@@ -533,11 +623,12 @@ getDetails ref = do
       Text.pack (show (displayDefault ref))
 
 -- | The queries deriving the facts demanded by a call and, transitively,
--- by the calls they make to predicates of the same component.
-componentDerivations :: Call -> E [CgDerivation]
+-- by the calls they make to predicates of the same component. Also
+-- returns all those calls.
+componentDerivations :: Call -> E ([CgDerivation], Set Call)
 componentDerivations start = go [start] Set.empty []
   where
-  go [] _ acc = return (concat (reverse acc))
+  go [] done acc = return (concat (reverse acc), done)
   go (this : rest) done acc
     | this `Set.member` done = go rest done acc
     | otherwise = do
@@ -789,4 +880,4 @@ freeVars bound0 = foldl' step (bound0, IntSet.empty)
       in
       ( IntSet.union boundThen boundElse
       , IntSet.unions [freeCond, freeThen, freeElse] )
-    CgRec first _ _ yield -> freeVars bound (first <> yield)
+    CgRec first _ _ yield _ -> freeVars bound (first <> yield)

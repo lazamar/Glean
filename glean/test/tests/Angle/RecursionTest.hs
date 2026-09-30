@@ -15,7 +15,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as BC
 import Data.Default (def)
 import Data.Int (Int64)
-import Data.List (isInfixOf, sort)
+import Data.List (isInfixOf, nub, sort)
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
@@ -28,7 +28,6 @@ import Util.String.Quasi
 
 import Glean.Angle.Types (AngleVersion(..), Type_(NatTy), latestAngleVersion)
 import Glean.Database.Schema.Types
-import Glean.Database.Config (Config(..))
 import Glean.Database.Types (Env)
 import Glean.Init
 import Glean (userQuery)
@@ -39,14 +38,11 @@ import Glean.Types as Thrift
 
 import Schema.Lib
 
-enableRecursion :: Config -> Config
-enableRecursion settings = settings { cfgEnableRecursion = True }
-
 recursionTest :: Test
 recursionTest = TestList
   [ TestLabel "compiles" $ TestCase $ do
     -- doesn't get stuck expanding recursive terms.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -74,7 +70,7 @@ recursionTest = TestList
 
   , TestLabel "calculates recursive relation with fixed arguments" $
     TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -105,7 +101,7 @@ recursionTest = TestList
           facts
 
   , TestLabel "non-linear recursion typechecks" $ TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -123,7 +119,7 @@ recursionTest = TestList
       $ \_ _ _ -> return ()
 
   , TestLabel "mutual recursion typechecks" $ TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           predicate P : nat
@@ -144,7 +140,7 @@ recursionTest = TestList
   , TestLabel "cycle closed by a later derive declaration" $ TestCase $ do
     -- P is declared without a derivation in x.1 and only gets one in x.2,
     -- closing the cycle P -> Q -> P across schemas.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           predicate Base : nat
@@ -175,7 +171,7 @@ recursionTest = TestList
     TestCase $ do
     -- Step is derived but not recursive, so it is inlined into each
     -- expansion of Path.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -207,7 +203,7 @@ recursionTest = TestList
     TestCase $ do
     -- Chain copies a linked list of Node facts, so the key of each
     -- derived Chain fact refers to another derived Chain fact.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           predicate Node : { label : nat, next : maybe Node }
@@ -237,7 +233,7 @@ recursionTest = TestList
 
   , TestLabel "accepts negation of a non-recursive predicate in recursion" $
     TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -271,7 +267,7 @@ recursionTest = TestList
 
   , TestLabel "left recursion with the last field bound" $ TestCase $ do
     -- Deriving Path { _, 4 } needs Path facts that don't end in 4.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -300,7 +296,7 @@ recursionTest = TestList
           (sort facts)
 
   , TestLabel "two calls to a recursive predicate" $ TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -325,7 +321,7 @@ recursionTest = TestList
           (sort nodes)
 
   , TestLabel "mutual recursion" $ TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           predicate P : nat
@@ -347,7 +343,7 @@ recursionTest = TestList
         assertEqual "S" [ RTS.Nat 1, RTS.Nat 2 ] (sort s)
 
   , TestLabel "cyclic data" $ TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -378,7 +374,7 @@ recursionTest = TestList
   , TestLabel "negation of a recursive predicate" $ TestCase $ do
     -- The design doc's example: routes that need a flight because there
     -- is no land route.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Town = nat
@@ -421,7 +417,7 @@ recursionTest = TestList
     -- demand, found the demand already there, it would assume it had been
     -- evaluated and miss results. Evaluations are isolated to avoid that,
     -- see Note [Isolation] in Glean.Query.Recursion.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -445,35 +441,11 @@ recursionTest = TestList
         assertEqual "nodes reachable from 1"
           (map RTS.Nat [2 .. 10]) (sort nodes)
 
-  , TestLabel "recursion must be enabled" $ TestCase $ do
-    withSchemaAndFacts []
-      [s|
-        schema x.1 {
-          type Node = nat
-          predicate Edge : { from: Node, to: Node }
-          predicate Path : { from: Node, to: Node }
-            { A, B } where
-              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
-        }
-        schema all.1 : x.1 {}
-      |]
-      [ mkBatch (PredicateRef "x.Edge" 1)
-          [ [s|{ "key": { "from": 1, "to": 2 } }|]
-          ]
-      ]
-      $ \env repo _ -> do
-        r <- runQ env repo [s| x.Path _ |]
-        case r of
-          Left (BadQuery err) ->
-            assertBool (unpack err) $
-              "recursive reference to predicate" `isInfixOf` unpack err
-          Right _ -> assertFailure "query succeeded"
-
   , TestLabel "results up to a limit, without continuing" $ TestCase $ do
     -- A query that reaches a limit returns the results it has found, and a
     -- continuation that can't be resumed, since the facts derived by its
     -- evaluations don't outlive the query.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -522,7 +494,7 @@ recursionTest = TestList
   , TestLabel "input from the call site" $ TestCase $ do
     -- The design doc's bounded recursion: Max only comes from the call
     -- site, so the facts can only be derived for the demanded Max.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -554,11 +526,157 @@ recursionTest = TestList
           ]
           (sort facts)
 
+  , TestLabel "record keys" $ TestCase $ do
+    -- The demand, Suspended, Supply and Completed facts all have record
+    -- keys here.
+    withSchemaAndFacts []
+      [s|
+        schema x.1 {
+          type Node = { name: string, n: nat }
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- a1 -> b2 -> c3 -> d4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": { "name": "a", "n": 1 }, "to": { "name": "b", "n": 2 } } }|]
+          , [s|{ "key": { "from": { "name": "b", "n": 2 }, "to": { "name": "c", "n": 3 } } }|]
+          , [s|{ "key": { "from": { "name": "c", "n": 3 }, "to": { "name": "d", "n": 4 } } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        nodes <- decodeNats =<< runQ env repo
+          [s| N where x.Path { { "a", 1 }, { _, N } } |]
+        assertEqual "nodes reachable from a" (map RTS.Nat [2, 3, 4]) (sort nodes)
+        -- the same call again for each result, which finds its demand
+        -- completed
+        pairs <- decodeNats =<< runQ env repo
+          [s| M where x.Path { { "a", 1 }, _ }; x.Path { { "a", 1 }, { _, M } } |]
+        assertEqual "repeated call" (map RTS.Nat [2, 3, 4]) (nub (sort pairs))
+
+  , TestLabel "a recursive call inside all" $ TestCase $ do
+    withSchemaAndFacts []
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4, 10 -> 11
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          , [s|{ "key": { "from": 10, "to": 11 } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        sizes <- decodeNats =<< runQ env repo
+          [s| prim.size (all (X where x.Path { N, X })) where N = (1 | 10) |]
+        assertEqual "sizes of the sets of reachable nodes"
+          (map RTS.Nat [1, 3]) (sort sizes)
+
+  , TestLabel "negated recursive call in a derived predicate" $ TestCase $ do
+    withSchemaAndFacts []
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+          # nodes with an edge that 1 can't reach
+          predicate Unreachable : Node
+            N where x.Edge { N, _ }; !x.Path { 1, N }
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3, 5 -> 6
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 5, "to": 6 } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        nodes <- decodeResultsAs "x.Unreachable.1" schema =<< runQ env repo
+          [s| x.Unreachable _ |]
+        assertEqual "nodes unreachable from 1" [RTS.Nat 1, RTS.Nat 5] (sort nodes)
+
+  , TestLabel "a recursive call in the condition of an if" $ TestCase $ do
+    withSchemaAndFacts []
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": 1, "to": 2 } }|]
+          , [s|{ "key": { "from": 2, "to": 3 } }|]
+          , [s|{ "key": { "from": 3, "to": 4 } }|]
+          ]
+      ]
+      $ \env repo _ -> do
+        answers <- decodeNats =<< runQ env repo
+          [s| R where T = (4 | 7); R = if (x.Path { 1, T }) then 1 else 0 |]
+        assertEqual "4 is reachable from 1, 7 isn't"
+          (map RTS.Nat [0, 1]) (sort answers)
+
+  , TestLabel "nested facts of results" $ TestCase $ do
+    -- runQ asks for results with their nested facts. Those are the Node
+    -- facts in the keys of the results, and none of the auxiliary facts
+    -- of the evaluation should leak out.
+    withSchemaAndFacts []
+      [s|
+        schema x.1 {
+          predicate Node : nat
+          predicate Edge : { from: x.Node, to: x.Node }
+          predicate Path : { from: x.Node, to: x.Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Path { A, K }; x.Edge { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> 3 -> 4
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ [s|{ "key": { "from": { "key": 1 }, "to": { "key": 2 } } }|]
+          , [s|{ "key": { "from": { "key": 2 }, "to": { "key": 3 } } }|]
+          , [s|{ "key": { "from": { "key": 3 }, "to": { "key": 4 } } }|]
+          ]
+      ]
+      $ \env repo schema -> do
+        response <- runQ env repo [s| x.Path { x.Node 1, _ } |]
+        facts <- decodeResultsAs "x.Path.1" schema response
+        assertEqual "results" 3 (length facts)
+        node <- either (assertFailure . unpack) (return . predicatePid) $
+          lookupPredicateSourceRef (parseRef "x.Node.1") LatestSchema schema
+        nested <- case response of
+          Right UserQueryResults
+            { userQueryResults_results = UserQueryEncodedResults_bin bin } ->
+            return (Map.elems (userQueryResultsBin_nestedFacts bin))
+          _ -> assertFailure "unexpected response"
+        assertEqual "nested facts are nodes"
+          (replicate 4 (fromIntegral (RTS.fromPid node)))
+          (map fact_type nested)
+
   , TestLabel "keeps values of any type across a recursive call" $
     TestCase $ do
     -- A and K are strings bound before the recursive call and used after
     -- it, and the key has a nested record.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           predicate Edge : { from: string, to: string }
@@ -589,7 +707,7 @@ recursionTest = TestList
           (sort facts)
 
   , TestLabel "only derives what the call needs" $ TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -632,7 +750,7 @@ recursionTest = TestList
           searched > 0 && searched < 30
 
   , TestLabel "non-linear recursion" $ TestCase $ do
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -658,14 +776,15 @@ recursionTest = TestList
           | a <- [1..4], b <- [a+1..4] ]
           (sort facts)
 
-  , TestLabel "each call derives its own facts" $ TestCase $ do
+  , TestLabel "repeated calls reuse derived facts" $ TestCase $ do
     -- The second call runs once for each of the 19 results of the first,
-    -- always with the same demand. Each of those evaluations is isolated
-    -- (see Note [Isolation] in Glean.Query.Recursion), so each one searches
-    -- the edges again.
-    -- TODO: caching completed demands (section 14 of the design) should
-    -- bring this down to the edges searched by a single call.
-    withSchemaAndFacts [enableRecursion]
+    -- always with the same demand. The first result arrives before the
+    -- first evaluation has finished, so the second call evaluates the
+    -- demand once and completes it. After that every call finds it
+    -- completed and just searches (see Note [Caching] in
+    -- Glean.Query.Recursion). So the edges are searched twice rather than
+    -- once for each call.
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -698,13 +817,47 @@ recursionTest = TestList
         repeated <- runQ env repo
           [s| { X, Y } where x.Path { 1, X }; x.Path { 1, Y } |]
         assertEqual "Edge facts searched"
-          (20 * searched once) (searched repeated)
+          (2 * searched once) (searched repeated)
+
+  , TestLabel "evaluations reuse completed subgoals" $ TestCase $ do
+    -- Path is right-recursive, so evaluating x.Path { 5, _ } completes the
+    -- demands for 5, 6, ..., 20. When we then evaluate x.Path { 1, _ } it
+    -- finds x.Path { 5, _ } completed and only searches the edges from 1
+    -- to 4 (see Note [Caching] in Glean.Query.Recursion). Together they
+    -- search as many edges as evaluating x.Path { 1, _ } alone.
+    withSchemaAndFacts []
+      [s|
+        schema x.1 {
+          type Node = nat
+          predicate Edge : { from: Node, to: Node }
+          predicate Path : { from: Node, to: Node }
+            { A, B } where
+              x.Edge { A, B } | (x.Edge { A, K }; x.Path { K, B })
+        }
+        schema all.1 : x.1 {}
+      |]
+      -- 1 -> 2 -> ... -> 20
+      [ mkBatch (PredicateRef "x.Edge" 1)
+          [ "{ \"key\": { \"from\": " <> BC.pack (show n) <>
+            ", \"to\": " <> BC.pack (show (n + 1)) <> " } }"
+          | n <- [1 .. 19 :: Int]
+          ]
+      ]
+      $ \env repo schema -> do
+        one <- runQ env repo [s| x.Path { 1, _ } |]
+        both <- runQ env repo [s| X where N = (5 | 1); x.Path { N, X } |]
+        nodes <- decodeNats both
+        assertEqual "nodes reachable from 1 or 5"
+          (map RTS.Nat [2 .. 20]) (nub (sort nodes))
+        searchedOne <- factsSearched schema "x.Edge.1" one
+        searchedBoth <- factsSearched schema "x.Edge.1" both
+        assertEqual "Edge facts searched" searchedOne searchedBoth
 
   , TestLabel "resumes a derivation once for each fact" $ TestCase $ do
     -- All the facts of x.Path { 1, _ } are derived for the same demand.
     -- Each x.Path { 1, K } should search for the edges from K once, not
     -- once in every round after it was derived.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -734,7 +887,7 @@ recursionTest = TestList
     -- Results come out of an evaluation after each round, so the negation
     -- can stop after the first round instead of deriving every path.
     -- See Note [Streaming] in Glean.Query.Recursion.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -768,7 +921,7 @@ recursionTest = TestList
     -- x.Path { 1, _ } demands x.Path { 2, _ }, x.Path { 3, _ }, ...). It
     -- mustn't assume that demand has been evaluated. See Note [Isolation]
     -- in Glean.Query.Recursion.
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
@@ -1020,7 +1173,7 @@ referenceTest = TestList
     , "x.Nested.1", "x.Then.1", "x.Else.1", "x.Composed.1" ]
 
   checkGraph nodes edges =
-    withSchemaAndFacts [enableRecursion]
+    withSchemaAndFacts []
       [s|
         schema x.1 {
           type Node = nat
